@@ -76,9 +76,21 @@ def analyze_jsonl_file(filepath):
     }
     
     last_request_ts = None  # Timestamp of last user message or toolResult
+    cwd = ""
     
     try:
         with open(filepath, 'r') as f:
+            # First, try to read cwd from the session line
+            first_line = f.readline().strip()
+            if first_line:
+                try:
+                    session_data = json.loads(first_line)
+                    if session_data.get("type") == "session":
+                        cwd = session_data.get("cwd", "")
+                except:
+                    pass
+            
+            # Now process the rest of the file
             for line in f:
                 try:
                     data = json.loads(line.strip())
@@ -129,6 +141,7 @@ def analyze_jsonl_file(filepath):
     except Exception as e:
         print(f"Error reading {filepath}: {e}")
     
+    stats["cwd"] = cwd
     return stats
 
 
@@ -161,6 +174,7 @@ def analyze_project(project_dir):
         session = {
             "file": filepath.name,
             "path": str(filepath),
+            "cwd": stats["cwd"],
             "messages": stats["messages"],
             "tokens": stats["total_tokens"],
             "cost": stats["cost_total"],
@@ -219,6 +233,20 @@ def export_session_to_html(session_path: str) -> str:
     return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(result.stderr)}</pre></body></html>"
 
 
+def get_session_cwd(session_path: str) -> str:
+    """Get the working directory from a session file."""
+    try:
+        with open(session_path, 'r') as f:
+            first_line = f.readline().strip()
+            if first_line:
+                data = json.loads(first_line)
+                if data.get("type") == "session" and "cwd" in data:
+                    return data["cwd"]
+    except:
+        pass
+    return ""
+
+
 def get_all_sessions():
     """Get a flat list of all sessions with their project info."""
     sessions = []
@@ -238,6 +266,7 @@ def get_all_sessions():
                     "project": project_name,
                     "file": filepath.name,
                     "path": str(filepath),
+                    "cwd": get_session_cwd(str(filepath)),
                     "messages": stats["messages"],
                     "tokens": stats["total_tokens"],
                     "cost": stats["cost_total"],
@@ -309,6 +338,7 @@ def generate_html():
             sessions_json.append({
                 "file": s["file"],
                 "path": s["path"],
+                "cwd": s["cwd"],
                 "messages": s["messages"],
                 "tokens": s["tokens"],
                 "cost": s["cost"],
@@ -709,6 +739,50 @@ def generate_html():
             color: var(--accent-green);
         }}
         
+        .copy-btn {{
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-right: 4px;
+            transition: background 0.2s;
+        }}
+        
+        .copy-btn:hover {{
+            background: var(--accent-blue);
+            border-color: var(--accent-blue);
+        }}
+        
+        .icon-btn {{
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px;
+            margin-right: 4px;
+            transition: color 0.2s;
+        }}
+        
+        .icon-btn:hover {{
+            color: var(--accent-blue);
+        }}
+        
+        .session-link {{
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 14px;
+            padding: 4px;
+            transition: color 0.2s;
+        }}
+        
+        .session-link:hover {{
+            color: var(--accent-blue);
+        }}
+        
         footer {{
             text-align: center;
             padding: 24px;
@@ -855,7 +929,7 @@ def generate_html():
                         <th data-sort="messages">Messages <span class="sort-icon">▼</span></th>
                         <th data-sort="tokens">Tokens <span class="sort-icon">▼</span></th>
                         <th data-sort="cost">Cost <span class="sort-icon">▼</span></th>
-                        <th>View</th>
+                        <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody id="sessions-tbody">
@@ -963,6 +1037,12 @@ def generate_html():
             tbody.innerHTML = sorted.map(s => {
                 const shortProject = s.project.length > 40 ? '...' + s.project.slice(-37) : s.project;
                 const sessionUrl = '/session?path=' + encodeURIComponent(s.path);
+                
+                // Build resume command with proper path separators
+                const resumePath = s.path.replace(/\\\\/g, '/');
+                const resumeCmd = 'cd "' + s.cwd + '" && pi --session "' + resumePath + '"';
+                const encodedCmd = encodeURIComponent(resumeCmd);
+                
                 return `
                     <tr>
                         <td class="project-name" title="${escapeHtml(s.project)}">${escapeHtml(shortProject)}</td>
@@ -972,10 +1052,29 @@ def generate_html():
                         <td>${s.messages}</td>
                         <td class="tokens">${s.tokens.toLocaleString()}</td>
                         <td class="cost">$${s.cost.toFixed(4)}</td>
-                        <td><a href="${sessionUrl}" class="session-link" target="_blank">Open →</a></td>
+                        <td>
+                            <button onclick="copyResumeCommand(decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
+                            <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
+                        </td>
                     </tr>
                 `;
             }).join('');
+        }
+        
+        function copyResumeCommand(cmd) {
+            navigator.clipboard.writeText(cmd).then(() => {
+                // Briefly show success feedback
+                const btn = event.target;
+                const originalText = btn.textContent;
+                btn.textContent = '✓';
+                btn.style.color = 'var(--accent-green)';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.color = '';
+                }, 1500);
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+            });
         }
         
         function setupSorting(tableId, sortState, renderFn) {
