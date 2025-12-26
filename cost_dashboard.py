@@ -1,0 +1,1089 @@
+#!/usr/bin/env python3
+"""Serve a dynamic HTML dashboard with cost statistics for all pi-agent sessions."""
+
+import json
+import os
+import subprocess
+import tempfile
+import urllib.parse
+from pathlib import Path
+from collections import defaultdict
+from datetime import datetime
+import html
+import http.server
+import socketserver
+import argparse
+
+SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
+TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
+
+
+def parse_timestamp(ts):
+    """Parse ISO timestamp string to datetime."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    except:
+        return None
+
+
+def format_duration(seconds):
+    """Format seconds into human-readable duration like 1h23m45s."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins}m{secs:02d}s" if secs else f"{mins}m"
+    else:
+        hours = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        return f"{hours}h{mins:02d}m" if mins else f"{hours}h"
+
+
+def get_project_path_from_jsonl(project_dir):
+    """Get the actual project path from the first session file's cwd field."""
+    jsonl_files = sorted(project_dir.glob("*.jsonl"))
+    for filepath in jsonl_files:
+        try:
+            with open(filepath, 'r') as f:
+                first_line = f.readline().strip()
+                if first_line:
+                    data = json.loads(first_line)
+                    if data.get("type") == "session" and "cwd" in data:
+                        return data["cwd"]
+        except:
+            continue
+    return project_dir.name
+
+
+def analyze_jsonl_file(filepath):
+    """Analyze a single JSONL file and return stats."""
+    stats = {
+        "messages": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "total_tokens": 0,
+        "cost_total": 0.0,
+        "models": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
+        "timestamps": [],
+        "start": None,
+        "end": None,
+        "llm_time": 0.0,  # Total LLM working time in seconds
+    }
+    
+    last_request_ts = None  # Timestamp of last user message or toolResult
+    
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                    if data.get("type") == "message" and "message" in data:
+                        msg = data["message"]
+                        if "usage" in msg:
+                            usage = msg["usage"]
+                            cost = usage.get("cost", {})
+                            model = msg.get("model", "unknown")
+                            
+                            stats["messages"] += 1
+                            stats["input_tokens"] += usage.get("input", 0)
+                            stats["output_tokens"] += usage.get("output", 0)
+                            stats["cache_read_tokens"] += usage.get("cacheRead", 0)
+                            stats["cache_write_tokens"] += usage.get("cacheWrite", 0)
+                            stats["total_tokens"] += usage.get("totalTokens", 0)
+                            stats["cost_total"] += cost.get("total", 0)
+                            
+                            stats["models"][model]["messages"] += 1
+                            stats["models"][model]["tokens"] += usage.get("totalTokens", 0)
+                            stats["models"][model]["cost"] += cost.get("total", 0)
+                            
+                            ts = parse_timestamp(data.get("timestamp"))
+                            if ts:
+                                stats["timestamps"].append(ts)
+                                if stats["start"] is None or ts < stats["start"]:
+                                    stats["start"] = ts
+                                if stats["end"] is None or ts > stats["end"]:
+                                    stats["end"] = ts
+                    
+                    # Track LLM working time (for all messages, not just ones with usage)
+                    if data.get("type") == "message" and "message" in data:
+                        ts = parse_timestamp(data.get("timestamp"))
+                        if ts:
+                            role = data["message"].get("role")
+                            if role == "assistant" and last_request_ts:
+                                llm_delta = (ts - last_request_ts).total_seconds()
+                                if 0 < llm_delta < 300:  # Cap at 5 min to filter outliers
+                                    stats["llm_time"] += llm_delta
+                                last_request_ts = None
+                            elif role == "user":
+                                last_request_ts = ts
+                            elif role == "toolResult":
+                                last_request_ts = ts
+                            
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}")
+    
+    return stats
+
+
+def analyze_project(project_dir):
+    """Analyze all sessions in a project directory."""
+    project_stats = {
+        "name": get_project_path_from_jsonl(project_dir),
+        "sessions": [],
+        "total_messages": 0,
+        "total_tokens": 0,
+        "total_cost": 0.0,
+        "total_llm_time": 0.0,
+        "models": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
+        "daily_stats": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
+        "first_activity": None,
+        "last_activity": None,
+    }
+    
+    jsonl_files = list(project_dir.glob("*.jsonl"))
+    if not jsonl_files:
+        return None
+    
+    for filepath in sorted(jsonl_files):
+        stats = analyze_jsonl_file(filepath)
+        if stats["messages"] == 0:
+            continue
+        
+        duration = (stats["end"] - stats["start"]).total_seconds() if stats["start"] and stats["end"] else 0
+        
+        session = {
+            "file": filepath.name,
+            "path": str(filepath),
+            "messages": stats["messages"],
+            "tokens": stats["total_tokens"],
+            "cost": stats["cost_total"],
+            "start": stats["start"],
+            "end": stats["end"],
+            "duration": duration,
+            "llm_time": stats["llm_time"],
+        }
+        project_stats["sessions"].append(session)
+        
+        project_stats["total_messages"] += stats["messages"]
+        project_stats["total_tokens"] += stats["total_tokens"]
+        project_stats["total_cost"] += stats["cost_total"]
+        project_stats["total_llm_time"] += stats["llm_time"]
+        
+        for model, mstats in stats["models"].items():
+            project_stats["models"][model]["messages"] += mstats["messages"]
+            project_stats["models"][model]["tokens"] += mstats["tokens"]
+            project_stats["models"][model]["cost"] += mstats["cost"]
+        
+        for ts in stats["timestamps"]:
+            day_key = ts.strftime("%Y-%m-%d")
+            project_stats["daily_stats"][day_key]["messages"] += 1
+            project_stats["daily_stats"][day_key]["cost"] += stats["cost_total"] / max(len(stats["timestamps"]), 1)
+        
+        if stats["start"]:
+            if project_stats["first_activity"] is None or stats["start"] < project_stats["first_activity"]:
+                project_stats["first_activity"] = stats["start"]
+        if stats["end"]:
+            if project_stats["last_activity"] is None or stats["end"] > project_stats["last_activity"]:
+                project_stats["last_activity"] = stats["end"]
+    
+    return project_stats if project_stats["sessions"] else None
+
+
+def export_session_to_html(session_path: str) -> str:
+    """Export a session file to HTML using pi --export."""
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Create a unique output filename based on the session path
+    session_hash = hash(session_path) & 0xffffffff
+    output_file = TEMP_DIR / f"session_{session_hash}.html"
+    
+    try:
+        result = subprocess.run(
+            ["pi", "--export", session_path, str(output_file)],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0 and output_file.exists():
+            return output_file.read_text()
+    except Exception as e:
+        return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(str(e))}</pre></body></html>"
+    
+    return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(result.stderr)}</pre></body></html>"
+
+
+def get_all_sessions():
+    """Get a flat list of all sessions with their project info."""
+    sessions = []
+    if not SESSIONS_DIR.exists():
+        return sessions
+    
+    for project_dir in SESSIONS_DIR.iterdir():
+        if not project_dir.is_dir() or project_dir.name.startswith('.'):
+            continue
+        
+        project_name = get_project_path_from_jsonl(project_dir)
+        
+        for filepath in project_dir.glob("*.jsonl"):
+            stats = analyze_jsonl_file(filepath)
+            if stats["messages"] > 0:
+                sessions.append({
+                    "project": project_name,
+                    "file": filepath.name,
+                    "path": str(filepath),
+                    "messages": stats["messages"],
+                    "tokens": stats["total_tokens"],
+                    "cost": stats["cost_total"],
+                    "start": stats["start"],
+                    "end": stats["end"],
+                })
+    
+    return sessions
+
+
+def collect_all_stats():
+    """Collect statistics from all projects."""
+    all_projects = []
+    global_stats = {
+        "total_cost": 0.0,
+        "total_tokens": 0,
+        "total_messages": 0,
+        "total_sessions": 0,
+        "total_projects": 0,
+        "total_llm_time": 0.0,
+        "models": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
+        "daily_stats": defaultdict(lambda: {"messages": 0, "cost": 0.0}),
+    }
+    
+    if not SESSIONS_DIR.exists():
+        return all_projects, global_stats
+    
+    for project_dir in SESSIONS_DIR.iterdir():
+        if not project_dir.is_dir() or project_dir.name.startswith('.'):
+            continue
+        
+        project_stats = analyze_project(project_dir)
+        if project_stats:
+            all_projects.append(project_stats)
+            global_stats["total_cost"] += project_stats["total_cost"]
+            global_stats["total_tokens"] += project_stats["total_tokens"]
+            global_stats["total_messages"] += project_stats["total_messages"]
+            global_stats["total_sessions"] += len(project_stats["sessions"])
+            global_stats["total_projects"] += 1
+            global_stats["total_llm_time"] += project_stats["total_llm_time"]
+            
+            for model, mstats in project_stats["models"].items():
+                global_stats["models"][model]["messages"] += mstats["messages"]
+                global_stats["models"][model]["tokens"] += mstats["tokens"]
+                global_stats["models"][model]["cost"] += mstats["cost"]
+            
+            for day, dstats in project_stats["daily_stats"].items():
+                global_stats["daily_stats"][day]["messages"] += dstats["messages"]
+                global_stats["daily_stats"][day]["cost"] += dstats["cost"]
+    
+    return all_projects, global_stats
+
+
+def generate_html():
+    """Generate HTML dashboard."""
+    all_projects, global_stats = collect_all_stats()
+    
+    # Sort projects by cost for initial display
+    all_projects.sort(key=lambda p: -p["total_cost"])
+    
+    # Build projects JSON for client-side sorting
+    projects_json = []
+    for p in all_projects:
+        sessions_json = []
+        for s in p["sessions"]:
+            duration_secs = s["duration"] if s["duration"] else 0
+            llm_secs = s["llm_time"] if s["llm_time"] else 0
+            
+            sessions_json.append({
+                "file": s["file"],
+                "path": s["path"],
+                "messages": s["messages"],
+                "tokens": s["tokens"],
+                "cost": s["cost"],
+                "start": s["start"].isoformat() if s["start"] else "",
+                "start_display": s["start"].strftime("%Y-%m-%d %H:%M") if s["start"] else "N/A",
+                "end": s["end"].isoformat() if s["end"] else "",  # Hidden, for sorting
+                "duration": duration_secs,
+                "duration_display": format_duration(duration_secs),
+                "llm_time": llm_secs,
+                "llm_time_display": format_duration(llm_secs),
+            })
+        # Build model breakdown for this project
+        models_list = []
+        for model_name, mstats in sorted(p["models"].items(), key=lambda x: -x[1]["cost"]):
+            models_list.append({
+                "name": model_name,
+                "messages": mstats["messages"],
+                "tokens": mstats["tokens"],
+                "cost": mstats["cost"],
+            })
+        
+        projects_json.append({
+            "name": p["name"],
+            "sessions": len(p["sessions"]),
+            "sessions_list": sessions_json,
+            "messages": p["total_messages"],
+            "tokens": p["total_tokens"],
+            "cost": p["total_cost"],
+            "llm_time": p["total_llm_time"],
+            "llm_time_display": format_duration(p["total_llm_time"]),
+            "last_activity": p["last_activity"].isoformat() if p["last_activity"] else "",
+            "last_activity_display": p["last_activity"].strftime("%Y-%m-%d %H:%M") if p["last_activity"] else "N/A",
+            "models": models_list,
+        })
+    
+    html_content = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pi Agent Cost Dashboard</title>
+    <style>
+        :root {{
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --border-color: #30363d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-yellow: #d29922;
+            --accent-red: #f85149;
+            --accent-purple: #a371f7;
+        }}
+        
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.5;
+            padding: 20px;
+        }}
+        
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+        }}
+        
+        h1 {{
+            font-size: 28px;
+            margin-bottom: 8px;
+        }}
+        
+        .subtitle {{
+            color: var(--text-secondary);
+            margin-bottom: 24px;
+        }}
+        
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 32px;
+        }}
+        
+        .stat-card {{
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+        }}
+        
+        .stat-card .label {{
+            color: var(--text-secondary);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        
+        .stat-card .value {{
+            font-size: 28px;
+            font-weight: 600;
+            margin-top: 4px;
+        }}
+        
+        .stat-card .value.cost {{
+            color: var(--accent-green);
+        }}
+        
+        .section {{
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            margin-bottom: 24px;
+            overflow: hidden;
+        }}
+        
+        .section-header {{
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        
+        .section-header .badge {{
+            background: var(--bg-tertiary);
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }}
+        
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        th, td {{
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }}
+        
+        th {{
+            background: var(--bg-tertiary);
+            font-weight: 600;
+            font-size: 12px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }}
+        
+        th:hover {{
+            color: var(--text-primary);
+        }}
+        
+        th .sort-icon {{
+            margin-left: 4px;
+            opacity: 0.3;
+        }}
+        
+        th.sorted .sort-icon {{
+            opacity: 1;
+        }}
+        
+        tr:hover {{
+            background: var(--bg-tertiary);
+        }}
+        
+        .project-name {{
+            font-family: monospace;
+            color: var(--accent-blue);
+        }}
+        
+        .cost {{
+            color: var(--accent-green);
+            font-weight: 500;
+        }}
+        
+        .tokens {{
+            color: var(--text-secondary);
+        }}
+        
+        .model-tag {{
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            margin-right: 4px;
+            margin-bottom: 4px;
+        }}
+        
+        .model-claude {{
+            background: rgba(167, 113, 247, 0.2);
+            color: var(--accent-purple);
+        }}
+        
+        .model-other {{
+            background: rgba(88, 166, 255, 0.2);
+            color: var(--accent-blue);
+        }}
+        
+        .bar-container {{
+            width: 100%;
+            height: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            overflow: hidden;
+        }}
+        
+        .bar {{
+            height: 100%;
+            background: var(--accent-green);
+            border-radius: 4px;
+        }}
+        
+        .daily-chart {{
+            padding: 16px;
+        }}
+        
+        .daily-bar {{
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+        }}
+        
+        .daily-bar .date {{
+            width: 100px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }}
+        
+        .daily-bar .bar-wrapper {{
+            flex: 1;
+            margin: 0 12px;
+        }}
+        
+        .daily-bar .amount {{
+            width: 80px;
+            text-align: right;
+            font-size: 13px;
+            color: var(--accent-green);
+        }}
+        
+        .refresh-note {{
+            color: var(--text-secondary);
+            font-size: 12px;
+        }}
+        
+        .session-link {{
+            color: var(--accent-blue);
+            text-decoration: none;
+            cursor: pointer;
+        }}
+        
+        .session-link:hover {{
+            text-decoration: underline;
+        }}
+        
+        .expand-btn {{
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 4px 8px;
+            font-size: 12px;
+        }}
+        
+        .expand-btn:hover {{
+            color: var(--text-primary);
+        }}
+        
+        .sessions-dropdown {{
+            display: none;
+            background: var(--bg-tertiary);
+            padding: 8px 16px;
+            margin-top: 4px;
+            border-radius: 4px;
+        }}
+        
+        .sessions-dropdown.show {{
+            display: block;
+        }}
+        
+        .session-item {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 0;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 13px;
+        }}
+        
+        .session-item:last-child {{
+            border-bottom: none;
+        }}
+        
+        .session-info {{
+            display: flex;
+            gap: 16px;
+            color: var(--text-secondary);
+        }}
+        
+        .back-link {{
+            color: var(--accent-blue);
+            text-decoration: none;
+            margin-bottom: 16px;
+            display: inline-block;
+        }}
+        
+        .back-link:hover {{
+            text-decoration: underline;
+        }}
+        
+        .expandable-row {{
+            cursor: pointer;
+        }}
+        
+        .expandable-row:hover {{
+            background: var(--bg-tertiary);
+        }}
+        
+        .expand-icon {{
+            display: inline-block;
+            width: 16px;
+            color: var(--text-secondary);
+            transition: transform 0.2s;
+        }}
+        
+        .expandable-row.expanded .expand-icon {{
+            transform: rotate(90deg);
+        }}
+        
+        .model-breakdown {{
+            display: none;
+        }}
+        
+        .model-breakdown.show {{
+            display: table-row;
+        }}
+        
+        .model-breakdown td {{
+            padding: 0;
+            background: var(--bg-tertiary);
+        }}
+        
+        .model-tree {{
+            padding: 8px 16px 8px 32px;
+        }}
+        
+        .model-item {{
+            display: flex;
+            align-items: center;
+            padding: 6px 0;
+            font-size: 13px;
+            border-bottom: 1px solid var(--border-color);
+        }}
+        
+        .model-item:last-child {{
+            border-bottom: none;
+        }}
+        
+        .model-item::before {{
+            content: "├─";
+            color: var(--text-secondary);
+            margin-right: 8px;
+            font-family: monospace;
+        }}
+        
+        .model-item:last-child::before {{
+            content: "└─";
+        }}
+        
+        .model-name {{
+            flex: 1;
+            color: var(--accent-purple);
+        }}
+        
+        .model-stat {{
+            margin-left: 16px;
+            color: var(--text-secondary);
+            min-width: 80px;
+            text-align: right;
+        }}
+        
+        .model-stat.cost {{
+            color: var(--accent-green);
+        }}
+        
+        footer {{
+            text-align: center;
+            padding: 24px;
+            color: var(--text-secondary);
+            font-size: 13px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Pi Agent Cost Dashboard</h1>
+        <p class="subtitle">Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} <span class="refresh-note">(Refresh page for updated stats)</span></p>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="label">Total Cost</div>
+                <div class="value cost">${global_stats["total_cost"]:.2f}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Projects</div>
+                <div class="value">{global_stats["total_projects"]}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Sessions</div>
+                <div class="value">{global_stats["total_sessions"]}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">API Calls</div>
+                <div class="value">{global_stats["total_messages"]:,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total Tokens</div>
+                <div class="value">{global_stats["total_tokens"]/1_000_000:.1f}M</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">LLM Time</div>
+                <div class="value" style="color: var(--accent-purple)">{format_duration(global_stats["total_llm_time"])}</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <span>📊 Daily Spending</span>
+            </div>
+            <div class="daily-chart">
+'''
+    
+    # Daily chart
+    if global_stats["daily_stats"]:
+        max_daily = max(d["cost"] for d in global_stats["daily_stats"].values())
+        for day in sorted(global_stats["daily_stats"].keys())[-14:]:
+            stats = global_stats["daily_stats"][day]
+            pct = (stats["cost"] / max_daily * 100) if max_daily > 0 else 0
+            html_content += f'''
+                <div class="daily-bar">
+                    <span class="date">{day}</span>
+                    <div class="bar-wrapper">
+                        <div class="bar-container">
+                            <div class="bar" style="width: {pct}%"></div>
+                        </div>
+                    </div>
+                    <span class="amount">${stats["cost"]:.2f}</span>
+                </div>
+'''
+    
+    html_content += '''
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <span>🤖 Models Used</span>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Model</th>
+                        <th>Messages</th>
+                        <th>Tokens</th>
+                        <th>Cost</th>
+                        <th>% of Total</th>
+                    </tr>
+                </thead>
+                <tbody>
+'''
+    
+    for model, mstats in sorted(global_stats["models"].items(), key=lambda x: -x[1]["cost"]):
+        pct = (mstats["cost"] / global_stats["total_cost"] * 100) if global_stats["total_cost"] > 0 else 0
+        model_class = "model-claude" if "claude" in model.lower() else "model-other"
+        html_content += f'''
+                    <tr>
+                        <td><span class="model-tag {model_class}">{html.escape(model)}</span></td>
+                        <td>{mstats["messages"]:,}</td>
+                        <td class="tokens">{mstats["tokens"]:,}</td>
+                        <td class="cost">${mstats["cost"]:.4f}</td>
+                        <td>
+                            <div class="bar-container" style="width: 100px; display: inline-block; vertical-align: middle;">
+                                <div class="bar" style="width: {pct}%"></div>
+                            </div>
+                            {pct:.1f}%
+                        </td>
+                    </tr>
+'''
+    
+    html_content += '''
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <span>📁 Projects</span>
+                <span class="badge">''' + str(len(all_projects)) + ''' projects</span>
+            </div>
+            <table id="projects-table">
+                <thead>
+                    <tr>
+                        <th data-sort="name" class="sorted">Project <span class="sort-icon">▲</span></th>
+                        <th data-sort="sessions">Sessions <span class="sort-icon">▼</span></th>
+                        <th data-sort="messages">Messages <span class="sort-icon">▼</span></th>
+                        <th data-sort="tokens">Tokens <span class="sort-icon">▼</span></th>
+                        <th data-sort="llm_time">LLM Time <span class="sort-icon">▼</span></th>
+                        <th data-sort="cost">Cost <span class="sort-icon">▼</span></th>
+                        <th data-sort="last_activity">Last Activity <span class="sort-icon">▼</span></th>
+                    </tr>
+                </thead>
+                <tbody id="projects-tbody">
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <span>📜 All Sessions</span>
+                <span class="badge" id="sessions-count"></span>
+            </div>
+            <table id="sessions-table">
+                <thead>
+                    <tr>
+                        <th data-sort="project">Project <span class="sort-icon">▼</span></th>
+                        <th data-sort="start">Date <span class="sort-icon">▼</span></th>
+                        <th data-sort="duration">Duration <span class="sort-icon">▼</span></th>
+                        <th data-sort="llm_time">LLM Time <span class="sort-icon">▼</span></th>
+                        <th data-sort="messages">Messages <span class="sort-icon">▼</span></th>
+                        <th data-sort="tokens">Tokens <span class="sort-icon">▼</span></th>
+                        <th data-sort="cost">Cost <span class="sort-icon">▼</span></th>
+                        <th>View</th>
+                    </tr>
+                </thead>
+                <tbody id="sessions-tbody">
+                </tbody>
+            </table>
+        </div>
+        
+        <footer>
+            Pi Agent Cost Dashboard • Data from ~/.pi/agent/sessions
+        </footer>
+    </div>
+    
+    <script>
+        const projects = ''' + json.dumps(projects_json) + ''';
+        
+        // Flatten all sessions for the sessions table
+        const allSessions = [];
+        projects.forEach(p => {
+            p.sessions_list.forEach(s => {
+                allSessions.push({
+                    project: p.name,
+                    ...s
+                });
+            });
+        });
+        
+        let projectSort = { field: 'cost', asc: false };
+        let sessionSort = { field: 'end', asc: false };  // Sort by last activity (most recent first)
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function sortData(data, sort) {
+            return [...data].sort((a, b) => {
+                let aVal = a[sort.field];
+                let bVal = b[sort.field];
+                
+                if (typeof aVal === 'string') {
+                    aVal = aVal.toLowerCase();
+                    bVal = bVal.toLowerCase();
+                }
+                
+                if (aVal < bVal) return sort.asc ? -1 : 1;
+                if (aVal > bVal) return sort.asc ? 1 : -1;
+                return 0;
+            });
+        }
+        
+        function renderProjects() {
+            const tbody = document.getElementById('projects-tbody');
+            const sorted = sortData(projects, projectSort);
+            const maxCost = Math.max(...projects.map(p => p.cost));
+            
+            tbody.innerHTML = sorted.map((p, idx) => {
+                const shortName = p.name.length > 50 ? '...' + p.name.slice(-47) : p.name;
+                const rowId = 'project-' + idx;
+                
+                // Build model breakdown HTML
+                const modelRows = p.models.map(m => `
+                    <div class="model-item">
+                        <span class="model-name">${escapeHtml(m.name)}</span>
+                        <span class="model-stat">${m.messages} msgs</span>
+                        <span class="model-stat">${m.tokens.toLocaleString()} tok</span>
+                        <span class="model-stat cost">$${m.cost.toFixed(4)}</span>
+                    </div>
+                `).join('');
+                
+                return `
+                    <tr class="expandable-row" data-target="${rowId}" onclick="toggleProjectRow('${rowId}')">
+                        <td class="project-name" title="${escapeHtml(p.name)}"><span class="expand-icon">▶</span> ${escapeHtml(shortName)}</td>
+                        <td>${p.sessions}</td>
+                        <td>${p.messages.toLocaleString()}</td>
+                        <td class="tokens">${p.tokens.toLocaleString()}</td>
+                        <td style="color: var(--accent-purple)">${p.llm_time_display}</td>
+                        <td class="cost">$${p.cost.toFixed(4)}</td>
+                        <td style="color: var(--text-secondary)">${p.last_activity_display}</td>
+                    </tr>
+                    <tr class="model-breakdown" id="${rowId}">
+                        <td colspan="7">
+                            <div class="model-tree">
+                                ${modelRows || '<div style="color: var(--text-secondary)">No model data</div>'}
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        function toggleProjectRow(rowId) {
+            const row = document.getElementById(rowId);
+            const parentRow = document.querySelector('[data-target="' + rowId + '"]');
+            row.classList.toggle('show');
+            parentRow.classList.toggle('expanded');
+        }
+        
+        function renderSessions() {
+            const tbody = document.getElementById('sessions-tbody');
+            const sorted = sortData(allSessions, sessionSort);
+            
+            document.getElementById('sessions-count').textContent = allSessions.length + ' sessions';
+            
+            tbody.innerHTML = sorted.map(s => {
+                const shortProject = s.project.length > 40 ? '...' + s.project.slice(-37) : s.project;
+                const sessionUrl = '/session?path=' + encodeURIComponent(s.path);
+                return `
+                    <tr>
+                        <td class="project-name" title="${escapeHtml(s.project)}">${escapeHtml(shortProject)}</td>
+                        <td style="color: var(--text-secondary)">${s.start_display}</td>
+                        <td style="color: var(--text-secondary)">${s.duration_display}</td>
+                        <td style="color: var(--accent-purple)">${s.llm_time_display}</td>
+                        <td>${s.messages}</td>
+                        <td class="tokens">${s.tokens.toLocaleString()}</td>
+                        <td class="cost">$${s.cost.toFixed(4)}</td>
+                        <td><a href="${sessionUrl}" class="session-link" target="_blank">Open →</a></td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        function setupSorting(tableId, sortState, renderFn) {
+            document.querySelectorAll(`#${tableId} th[data-sort]`).forEach(th => {
+                th.addEventListener('click', () => {
+                    const field = th.dataset.sort;
+                    if (sortState.field === field) {
+                        sortState.asc = !sortState.asc;
+                    } else {
+                        sortState.field = field;
+                        sortState.asc = field === 'name' || field === 'project';
+                    }
+                    updateSortIcons(tableId, sortState);
+                    renderFn();
+                });
+            });
+        }
+        
+        function updateSortIcons(tableId, sortState) {
+            document.querySelectorAll(`#${tableId} th`).forEach(th => {
+                const field = th.dataset.sort;
+                const icon = th.querySelector('.sort-icon');
+                if (!icon) return;
+                if (field === sortState.field) {
+                    th.classList.add('sorted');
+                    icon.textContent = sortState.asc ? '▲' : '▼';
+                } else {
+                    th.classList.remove('sorted');
+                    icon.textContent = '▼';
+                }
+            });
+        }
+        
+        // Setup
+        setupSorting('projects-table', projectSort, renderProjects);
+        setupSorting('sessions-table', sessionSort, renderSessions);
+        
+        // Initial render
+        renderProjects();
+        renderSessions();
+        updateSortIcons('projects-table', projectSort);
+        updateSortIcons('sessions-table', sessionSort);
+    </script>
+</body>
+</html>
+'''
+    
+    return html_content
+
+
+class DashboardHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP request handler for the dashboard."""
+    
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        
+        if parsed.path == '/' or parsed.path == '/index.html':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
+            html_content = generate_html()
+            self.wfile.write(html_content.encode('utf-8'))
+        
+        elif parsed.path == '/session':
+            session_path = query.get('path', [None])[0]
+            if session_path and Path(session_path).exists():
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.end_headers()
+                html_content = export_session_to_html(session_path)
+                self.wfile.write(html_content.encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(b'<html><body><h1>Session not found</h1></body></html>')
+        
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {args[0]}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Pi Agent Cost Dashboard Server')
+    parser.add_argument('-p', '--port', type=int, default=8080, help='Port to serve on (default: 8080)')
+    args = parser.parse_args()
+    
+    # Check if sessions directory exists
+    if not SESSIONS_DIR.exists():
+        print(f"⚠️  Sessions directory not found: {SESSIONS_DIR}")
+        print("   No data to display yet.")
+    
+    # Start server
+    with socketserver.TCPServer(("", args.port), DashboardHandler) as httpd:
+        print(f"🚀 Pi Agent Cost Dashboard")
+        print(f"   Serving on: http://localhost:{args.port}")
+        print(f"   Data from:  {SESSIONS_DIR}")
+        print(f"\n   Press Ctrl+C to stop\n")
+        
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n👋 Shutting down...")
+
+
+if __name__ == "__main__":
+    main()
