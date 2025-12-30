@@ -17,6 +17,45 @@ import argparse
 SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
 
+# Manual pricing for models that report zero cost (price per million tokens)
+# Format: model_pattern -> {"input": price_per_M, "output": price_per_M, "cache_read": price_per_M}
+MANUAL_PRICING = {
+    # Gemini models via Google Cloud Code Assist (free tier, but estimate value)
+    # Pricing based on public Gemini API pricing as of Dec 2024
+    "gemini-2.5-pro": {
+        "input": 1.25,      # $1.25 per 1M input tokens
+        "output": 10.00,    # $10.00 per 1M output tokens (with thinking)
+        "cache_read": 0.31, # $0.3125 per 1M cached tokens
+    },
+    "gemini-2.5-flash": {
+        "input": 0.15,      # $0.15 per 1M input tokens
+        "output": 0.60,     # $0.60 per 1M output tokens
+        "cache_read": 0.0375,
+    },
+    "gemini-2.0-flash": {
+        "input": 0.10,
+        "output": 0.40,
+        "cache_read": 0.025,
+    },
+    "gemini-3-pro-preview": {
+        # Use same pricing as gemini-2.5-pro as estimate
+        "input": 1.25,
+        "output": 10.00,
+        "cache_read": 0.31,
+    },
+}
+
+
+def get_manual_cost(model: str, input_tokens: int, output_tokens: int, cache_read_tokens: int) -> float:
+    """Calculate cost using manual pricing if available."""
+    for pattern, pricing in MANUAL_PRICING.items():
+        if pattern in model.lower():
+            input_cost = (input_tokens / 1_000_000) * pricing["input"]
+            output_cost = (output_tokens / 1_000_000) * pricing["output"]
+            cache_cost = (cache_read_tokens / 1_000_000) * pricing.get("cache_read", 0)
+            return input_cost + output_cost + cache_cost
+    return 0.0
+
 
 def parse_timestamp(ts):
     """Parse ISO timestamp string to datetime."""
@@ -101,17 +140,29 @@ def analyze_jsonl_file(filepath):
                             cost = usage.get("cost", {})
                             model = msg.get("model", "unknown")
                             
+                            # Calculate cost - use reported cost or manual pricing
+                            input_tok = usage.get("input", 0)
+                            output_tok = usage.get("output", 0)
+                            cache_read_tok = usage.get("cacheRead", 0)
+                            cache_write_tok = usage.get("cacheWrite", 0)
+                            total_tok = usage.get("totalTokens", 0)
+                            reported_cost = cost.get("total", 0)
+                            
+                            # If reported cost is 0, try manual pricing
+                            if reported_cost == 0:
+                                reported_cost = get_manual_cost(model, input_tok, output_tok, cache_read_tok)
+                            
                             stats["messages"] += 1
-                            stats["input_tokens"] += usage.get("input", 0)
-                            stats["output_tokens"] += usage.get("output", 0)
-                            stats["cache_read_tokens"] += usage.get("cacheRead", 0)
-                            stats["cache_write_tokens"] += usage.get("cacheWrite", 0)
-                            stats["total_tokens"] += usage.get("totalTokens", 0)
-                            stats["cost_total"] += cost.get("total", 0)
+                            stats["input_tokens"] += input_tok
+                            stats["output_tokens"] += output_tok
+                            stats["cache_read_tokens"] += cache_read_tok
+                            stats["cache_write_tokens"] += cache_write_tok
+                            stats["total_tokens"] += total_tok
+                            stats["cost_total"] += reported_cost
                             
                             stats["models"][model]["messages"] += 1
-                            stats["models"][model]["tokens"] += usage.get("totalTokens", 0)
-                            stats["models"][model]["cost"] += cost.get("total", 0)
+                            stats["models"][model]["tokens"] += total_tok
+                            stats["models"][model]["cost"] += reported_cost
                             
                             ts = parse_timestamp(data.get("timestamp"))
                             if ts:
