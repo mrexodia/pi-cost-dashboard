@@ -210,7 +210,8 @@ def analyze_project(project_dir):
         "first_activity": None,
         "last_activity": None,
     }
-    
+
+    # Only get top-level JSONL files (not in subdirectories)
     jsonl_files = list(project_dir.glob("*.jsonl"))
     if not jsonl_files:
         return None
@@ -219,12 +220,62 @@ def analyze_project(project_dir):
         stats = analyze_jsonl_file(filepath)
         if stats["messages"] == 0:
             continue
-        
+
         duration = (stats["end"] - stats["start"]).total_seconds() if stats["start"] and stats["end"] else 0
-        
+
+        # Look for subagent sessions in a matching subdirectory
+        # e.g., "session.jsonl" -> "session/" directory
+        session_name = filepath.stem  # filename without .jsonl extension
+        subagent_dir = filepath.parent / session_name
+
+        subagent_sessions = []
+        if subagent_dir.exists() and subagent_dir.is_dir():
+            # Find all JSONL files in the subagent directory
+            for sub_jsonl in sorted(subagent_dir.rglob("*.jsonl")):
+                sub_stats = analyze_jsonl_file(sub_jsonl)
+                if sub_stats["messages"] > 0:
+                    sub_duration = (sub_stats["end"] - sub_stats["start"]).total_seconds() if sub_stats["start"] and sub_stats["end"] else 0
+                    try:
+                        sub_relative = sub_jsonl.relative_to(project_dir)
+                    except ValueError:
+                        sub_relative = sub_jsonl
+
+                    subagent_sessions.append({
+                        "file": sub_jsonl.name,
+                        "path": str(sub_jsonl),
+                        "relative_path": str(sub_relative),
+                        "cwd": sub_stats["cwd"],
+                        "messages": sub_stats["messages"],
+                        "tokens": sub_stats["total_tokens"],
+                        "cost": sub_stats["cost_total"],
+                        "start": sub_stats["start"],
+                        "end": sub_stats["end"],
+                        "duration": sub_duration,
+                        "llm_time": sub_stats["llm_time"],
+                    })
+
+                    # Include subagent stats in project totals
+                    project_stats["total_messages"] += sub_stats["messages"]
+                    project_stats["total_tokens"] += sub_stats["total_tokens"]
+                    project_stats["total_cost"] += sub_stats["cost_total"]
+                    project_stats["total_llm_time"] += sub_stats["llm_time"]
+
+                    # Track subagent model usage
+                    for model, mstats in sub_stats["models"].items():
+                        project_stats["models"][model]["messages"] += mstats["messages"]
+                        project_stats["models"][model]["tokens"] += mstats["tokens"]
+                        project_stats["models"][model]["cost"] += mstats["cost"]
+
+                    # Track subagent daily stats
+                    for ts in sub_stats["timestamps"]:
+                        day_key = ts.strftime("%Y-%m-%d")
+                        project_stats["daily_stats"][day_key]["messages"] += 1
+                        project_stats["daily_stats"][day_key]["cost"] += sub_stats["cost_total"] / max(len(sub_stats["timestamps"]), 1)
+
         session = {
             "file": filepath.name,
             "path": str(filepath),
+            "relative_path": filepath.name,  # Top-level, just the filename
             "cwd": stats["cwd"],
             "messages": stats["messages"],
             "tokens": stats["total_tokens"],
@@ -233,6 +284,7 @@ def analyze_project(project_dir):
             "end": stats["end"],
             "duration": duration,
             "llm_time": stats["llm_time"],
+            "subagent_sessions": subagent_sessions,  # List of nested sessions
         }
         project_stats["sessions"].append(session)
         
@@ -303,20 +355,49 @@ def get_all_sessions():
     sessions = []
     if not SESSIONS_DIR.exists():
         return sessions
-    
+
     for project_dir in SESSIONS_DIR.iterdir():
         if not project_dir.is_dir() or project_dir.name.startswith('.'):
             continue
-        
+
         project_name = get_project_path_from_jsonl(project_dir)
-        
+
+        # Only get top-level JSONL files
         for filepath in project_dir.glob("*.jsonl"):
             stats = analyze_jsonl_file(filepath)
             if stats["messages"] > 0:
+                # Look for subagent sessions in matching subdirectory
+                session_name = filepath.stem
+                subagent_dir = filepath.parent / session_name
+
+                if subagent_dir.exists() and subagent_dir.is_dir():
+                    # Add subagent sessions
+                    for sub_jsonl in subagent_dir.rglob("*.jsonl"):
+                        sub_stats = analyze_jsonl_file(sub_jsonl)
+                        if sub_stats["messages"] > 0:
+                            try:
+                                sub_relative = sub_jsonl.relative_to(project_dir)
+                            except ValueError:
+                                sub_relative = sub_jsonl.name
+
+                            sessions.append({
+                                "project": project_name,
+                                "file": sub_jsonl.name,
+                                "path": str(sub_jsonl),
+                                "relative_path": str(sub_relative),
+                                "cwd": get_session_cwd(str(sub_jsonl)),
+                                "messages": sub_stats["messages"],
+                                "tokens": sub_stats["total_tokens"],
+                                "cost": sub_stats["cost_total"],
+                                "start": sub_stats["start"],
+                                "end": sub_stats["end"],
+                            })
+
                 sessions.append({
                     "project": project_name,
                     "file": filepath.name,
                     "path": str(filepath),
+                    "relative_path": filepath.name,
                     "cwd": get_session_cwd(str(filepath)),
                     "messages": stats["messages"],
                     "tokens": stats["total_tokens"],
@@ -324,7 +405,7 @@ def get_all_sessions():
                     "start": stats["start"],
                     "end": stats["end"],
                 })
-    
+
     return sessions
 
 
@@ -385,21 +466,45 @@ def generate_html():
         for s in p["sessions"]:
             duration_secs = s["duration"] if s["duration"] else 0
             llm_secs = s["llm_time"] if s["llm_time"] else 0
-            
+
+            # Include subagent sessions in JSON
+            sub_sessions_json = []
+            for sub in s.get("subagent_sessions", []):
+                sub_duration = sub["duration"] if sub["duration"] else 0
+                sub_llm = sub["llm_time"] if sub["llm_time"] else 0
+                sub_sessions_json.append({
+                    "file": sub["file"],
+                    "path": sub["path"],
+                    "relative_path": sub["relative_path"],
+                    "cwd": sub["cwd"],
+                    "messages": sub["messages"],
+                    "tokens": sub["tokens"],
+                    "cost": sub["cost"],
+                    "start": sub["start"].isoformat() if sub["start"] else "",
+                    "start_display": sub["start"].strftime("%Y-%m-%d %H:%M") if sub["start"] else "N/A",
+                    "end": sub["end"].isoformat() if sub["end"] else "",
+                    "duration": sub_duration,
+                    "duration_display": format_duration(sub_duration),
+                    "llm_time": sub_llm,
+                    "llm_time_display": format_duration(sub_llm),
+                })
+
             sessions_json.append({
                 "file": s["file"],
                 "path": s["path"],
+                "relative_path": s.get("relative_path", s["file"]),
                 "cwd": s["cwd"],
                 "messages": s["messages"],
                 "tokens": s["tokens"],
                 "cost": s["cost"],
                 "start": s["start"].isoformat() if s["start"] else "",
                 "start_display": s["start"].strftime("%Y-%m-%d %H:%M") if s["start"] else "N/A",
-                "end": s["end"].isoformat() if s["end"] else "",  # Hidden, for sorting
+                "end": s["end"].isoformat() if s["end"] else "",
                 "duration": duration_secs,
                 "duration_display": format_duration(duration_secs),
                 "llm_time": llm_secs,
                 "llm_time_display": format_duration(llm_secs),
+                "subagent_sessions": sub_sessions_json,
             })
         # Build model breakdown for this project
         models_list = []
@@ -763,17 +868,6 @@ def generate_html():
             border-bottom: none;
         }}
         
-        .model-item::before {{
-            content: "├─";
-            color: var(--text-secondary);
-            margin-right: 8px;
-            font-family: monospace;
-        }}
-        
-        .model-item:last-child::before {{
-            content: "└─";
-        }}
-        
         .model-name {{
             flex: 1;
             color: var(--accent-purple);
@@ -973,7 +1067,7 @@ def generate_html():
             <table id="sessions-table">
                 <thead>
                     <tr>
-                        <th data-sort="project">Project <span class="sort-icon">▼</span></th>
+                        <th>Project / Session</th>
                         <th data-sort="start">Date <span class="sort-icon">▼</span></th>
                         <th data-sort="duration">Duration <span class="sort-icon">▼</span></th>
                         <th data-sort="llm_time">LLM Time <span class="sort-icon">▼</span></th>
@@ -995,7 +1089,21 @@ def generate_html():
     
     <script>
         const projects = ''' + json.dumps(projects_json) + ''';
-        
+
+        function formatDuration(seconds) {
+            if (seconds < 60) {
+                return Math.round(seconds) + 's';
+            } else if (seconds < 3600) {
+                const mins = Math.floor(seconds / 60);
+                const secs = Math.round(seconds % 60);
+                return mins + 'm' + secs.toString().padStart(2, '0') + 's';
+            } else {
+                const hours = Math.floor(seconds / 3600);
+                const mins = Math.round((seconds % 3600) / 60);
+                return hours + 'h' + mins.toString().padStart(2, '0') + 'm';
+            }
+        }
+
         // Flatten all sessions for the sessions table
         const allSessions = [];
         projects.forEach(p => {
@@ -1006,9 +1114,19 @@ def generate_html():
                 });
             });
         });
-        
+
+        // Group sessions by project for expandable display
+        const sessionsByProject = {};
+        allSessions.forEach(s => {
+            if (!sessionsByProject[s.project]) {
+                sessionsByProject[s.project] = [];
+            }
+            sessionsByProject[s.project].push(s);
+        });
+
         let projectSort = { field: 'cost', asc: false };
         let sessionSort = { field: 'end', asc: false };  // Sort by last activity (most recent first)
+        let sessionsSort = { field: 'end', asc: false };
         
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -1081,35 +1199,165 @@ def generate_html():
         
         function renderSessions() {
             const tbody = document.getElementById('sessions-tbody');
-            const sorted = sortData(allSessions, sessionSort);
-            
-            document.getElementById('sessions-count').textContent = allSessions.length + ' sessions';
-            
-            tbody.innerHTML = sorted.map(s => {
-                const shortProject = s.project.length > 40 ? '...' + s.project.slice(-37) : s.project;
+
+            // Flatten sessions with subagent info
+            const allSessionsWithSubs = [];
+            projects.forEach(p => {
+                p.sessions_list.forEach(s => {
+                    allSessionsWithSubs.push(s);
+                });
+            });
+
+            // Sort by aggregated cost
+            const sortedSessions = [...allSessionsWithSubs].sort((a, b) => {
+                const aCost = a.cost + (a.subagent_sessions || []).reduce((sum, s) => sum + s.cost, 0);
+                const bCost = b.cost + (b.subagent_sessions || []).reduce((sum, s) => sum + s.cost, 0);
+                return bCost - aCost;
+            });
+
+            const totalSessions = allSessionsWithSubs.reduce((sum, s) => sum + 1 + (s.subagent_sessions || []).length, 0);
+            document.getElementById('sessions-count').textContent = totalSessions + ' sessions';
+
+            let html = '';
+            let rowIdx = 0;
+
+            sortedSessions.forEach(s => {
+                const subs = s.subagent_sessions || [];
+                const hasSubs = subs.length > 0;
+
+                // If no subagent sessions, just show the main session as a regular row
+                if (!hasSubs) {
+                    const sessionUrl = '/session?path=' + encodeURIComponent(s.path);
+                    const resumePath = s.path.replace(/\\\\/g, '/');
+                    const resumeCmd = 'cd "' + s.cwd + '" && pi --session "' + resumePath + '"';
+                    const encodedCmd = encodeURIComponent(resumeCmd);
+                    const shortProject = s.cwd.length > 40 ? '...' + s.cwd.slice(-37) : s.cwd;
+
+                    html += `
+                        <tr>
+                            <td class="project-name" title="${escapeHtml(s.cwd)}">${escapeHtml(shortProject)}</td>
+                            <td style="color: var(--text-secondary)">${s.start_display}</td>
+                            <td style="color: var(--text-secondary)">${s.duration_display}</td>
+                            <td style="color: var(--accent-purple)">${s.llm_time_display}</td>
+                            <td>${s.messages.toLocaleString()}</td>
+                            <td class="tokens">${s.tokens.toLocaleString()}</td>
+                            <td class="cost">$${s.cost.toFixed(2)}</td>
+                            <td>
+                                <button onclick="copyResumeCommand(decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
+                                <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+
+                // Has subagent sessions - show expandable summary
+                const allSessionsInGroup = [s, ...subs];
+                const projectId = 'session-group-' + rowIdx;
+                rowIdx++;
+
+                // Calculate aggregated totals
+                const aggCost = allSessionsInGroup.reduce((sum, session) => sum + session.cost, 0);
+                const aggTokens = allSessionsInGroup.reduce((sum, session) => sum + session.tokens, 0);
+                const aggMessages = allSessionsInGroup.reduce((sum, session) => sum + session.messages, 0);
+                const aggLlmTime = allSessionsInGroup.reduce((sum, session) => sum + (session.llm_time || 0), 0);
+
+                // Get earliest start and latest end
+                const starts = allSessionsInGroup.map(session => session.start).filter(Boolean);
+                const ends = allSessionsInGroup.map(session => session.end).filter(Boolean);
+                const earliestStart = starts.length ? new Date(Math.min(...starts.map(d => new Date(d)))) : null;
+                const latestEnd = ends.length ? new Date(Math.max(...ends.map(d => new Date(d)))) : null;
+                const totalDuration = earliestStart && latestEnd ? (latestEnd - earliestStart) / 1000 : 0;
+
+                const shortProject = s.cwd.length > 40 ? '...' + s.cwd.slice(-37) : s.cwd;
+
+                // Format date to match other sessions (YYYY-MM-DD HH:MM)
+                const dateDisplay = s.start_display;
+
+                // Summary row with resume/open buttons
                 const sessionUrl = '/session?path=' + encodeURIComponent(s.path);
-                
-                // Build resume command with proper path separators
                 const resumePath = s.path.replace(/\\\\/g, '/');
                 const resumeCmd = 'cd "' + s.cwd + '" && pi --session "' + resumePath + '"';
                 const encodedCmd = encodeURIComponent(resumeCmd);
-                
-                return `
-                    <tr>
-                        <td class="project-name" title="${escapeHtml(s.project)}">${escapeHtml(shortProject)}</td>
-                        <td style="color: var(--text-secondary)">${s.start_display}</td>
-                        <td style="color: var(--text-secondary)">${s.duration_display}</td>
-                        <td style="color: var(--accent-purple)">${s.llm_time_display}</td>
-                        <td>${s.messages}</td>
-                        <td class="tokens">${s.tokens.toLocaleString()}</td>
-                        <td class="cost">$${s.cost.toFixed(2)}</td>
+
+                html += `
+                    <tr class="expandable-row" data-target="${projectId}" onclick="toggleProjectRow('${projectId}')">
+                        <td class="project-name" title="${escapeHtml(s.cwd)}">
+                            <span class="expand-icon">▶</span>
+                            ${escapeHtml(shortProject)}
+                        </td>
+                        <td style="color: var(--text-secondary)">${dateDisplay}</td>
+                        <td style="color: var(--text-secondary)">${formatDuration(totalDuration)}</td>
+                        <td style="color: var(--accent-purple)">${formatDuration(aggLlmTime)}</td>
+                        <td>${aggMessages.toLocaleString()}</td>
+                        <td class="tokens">${aggTokens.toLocaleString()}</td>
+                        <td class="cost">$${aggCost.toFixed(2)}</td>
                         <td>
+                            <button onclick="event.stopPropagation(); copyResumeCommand(decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
+                            <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session" onclick="event.stopPropagation()">Open →</a>
+                        </td>
+                    </tr>
+                    <tr class="model-breakdown" id="${projectId}">
+                        <td colspan="8" style="padding: 0">
+                            <div class="model-tree">
+                `;
+
+                // Main session with buttons
+                html += `
+                    <div class="model-item">
+                        <span class="model-name" title="${escapeHtml(s.file)}">
+                            <strong>📁 Main Session:</strong> ${escapeHtml(s.file)}
+                        </span>
+                        <span class="model-stat">${s.start_display}</span>
+                        <span class="model-stat">${s.duration_display}</span>
+                        <span class="model-stat" style="color: var(--accent-purple)">${s.llm_time_display}</span>
+                        <span class="model-stat">${s.messages} msgs</span>
+                        <span class="model-stat">${s.tokens.toLocaleString()} tok</span>
+                        <span class="model-stat cost">$${s.cost.toFixed(2)}</span>
+                        <span style="margin-left: 8px">
                             <button onclick="copyResumeCommand(decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
                             <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
+                        </span>
+                    </div>
+                `;
+
+                // Subagent sessions with buttons
+                subs.forEach(sub => {
+                    const subSessionUrl = '/session?path=' + encodeURIComponent(sub.path);
+                    const subResumePath = sub.path.replace(/\\\\/g, '/');
+                    const subResumeCmd = 'cd "' + sub.cwd + '" && pi --session "' + subResumePath + '"';
+                    const subEncodedCmd = encodeURIComponent(subResumeCmd);
+
+                    // Just show the filename, not the full relative path
+                    const fileName = sub.file;
+
+                    html += `
+                        <div class="model-item">
+                            <span class="model-name" title="${escapeHtml(sub.relative_path)}">
+                                ${escapeHtml(fileName)}
+                            </span>
+                            <span class="model-stat">${sub.start_display}</span>
+                            <span class="model-stat">${sub.duration_display}</span>
+                            <span class="model-stat" style="color: var(--accent-purple)">${sub.llm_time_display}</span>
+                            <span class="model-stat">${sub.messages} msgs</span>
+                            <span class="model-stat">${sub.tokens.toLocaleString()} tok</span>
+                            <span class="model-stat cost">$${sub.cost.toFixed(2)}</span>
+                            <span style="margin-left: 8px">
+                                <button onclick="copyResumeCommand(decodeURIComponent('${subEncodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
+                                <a href="${subSessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
+                            </span>
+                        </div>
+                    `;
+                });
+
+                html += `
+                            </div>
                         </td>
                     </tr>
                 `;
-            }).join('');
+            });
+
+            tbody.innerHTML = html;
         }
         
         function copyResumeCommand(cmd) {
@@ -1136,7 +1384,7 @@ def generate_html():
                         sortState.asc = !sortState.asc;
                     } else {
                         sortState.field = field;
-                        sortState.asc = field === 'name' || field === 'project';
+                        sortState.asc = field === 'name' || field === 'project' || field === 'start';
                     }
                     updateSortIcons(tableId, sortState);
                     renderFn();
@@ -1161,13 +1409,13 @@ def generate_html():
         
         // Setup
         setupSorting('projects-table', projectSort, renderProjects);
-        setupSorting('sessions-table', sessionSort, renderSessions);
-        
+        setupSorting('sessions-table', sessionsSort, renderSessions);
+
         // Initial render
         renderProjects();
         renderSessions();
         updateSortIcons('projects-table', projectSort);
-        updateSortIcons('sessions-table', sessionSort);
+        updateSortIcons('sessions-table', sessionsSort);
     </script>
 </body>
 </html>
@@ -1216,23 +1464,35 @@ def main():
     parser = argparse.ArgumentParser(description='Pi Agent Cost Dashboard Server')
     parser.add_argument('-p', '--port', type=int, default=8080, help='Port to serve on (default: 8080)')
     args = parser.parse_args()
-    
+
     # Check if sessions directory exists
     if not SESSIONS_DIR.exists():
         print(f"⚠️  Sessions directory not found: {SESSIONS_DIR}")
         print("   No data to display yet.")
-    
+
     # Start server
-    with socketserver.TCPServer(("", args.port), DashboardHandler) as httpd:
-        print(f"🚀 Pi Agent Cost Dashboard")
-        print(f"   Serving on: http://localhost:{args.port}")
-        print(f"   Data from:  {SESSIONS_DIR}")
-        print(f"\n   Press Ctrl+C to stop\n")
-        
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\n👋 Shutting down...")
+    class DashboardServer(socketserver.TCPServer):
+        def server_bind(self):
+            # Allow port reuse to avoid "Address already in use" on quick restart
+            self.allow_reuse_address = True
+            socketserver.TCPServer.server_bind(self)
+
+    httpd = DashboardServer(("", args.port), DashboardHandler)
+    print(f"🚀 Pi Agent Cost Dashboard")
+    print(f"   Serving on: http://localhost:{args.port}")
+    print(f"   Data from:  {SESSIONS_DIR}")
+    print(f"\n   Press Ctrl+C to stop\n")
+
+    # Set a timeout on the socket so we can check for shutdown periodically
+    httpd.timeout = 0.5
+
+    try:
+        while True:
+            httpd.handle_request()
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down...")
+    finally:
+        httpd.server_close()
 
 
 if __name__ == "__main__":
