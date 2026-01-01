@@ -928,7 +928,7 @@ def generate_html():
                         <td><span class="model-tag {model_class}">{html.escape(model)}</span></td>
                         <td>{mstats["messages"]:,}</td>
                         <td class="tokens">{mstats["tokens"]:,}</td>
-                        <td class="cost">${mstats["cost"]:.4f}</td>
+                        <td class="cost">${mstats["cost"]:.2f}</td>
                         <td>
                             <div class="bar-container" style="width: 100px; display: inline-block; vertical-align: middle;">
                                 <div class="bar" style="width: {pct}%"></div>
@@ -1047,7 +1047,7 @@ def generate_html():
                         <span class="model-name">${escapeHtml(m.name)}</span>
                         <span class="model-stat">${m.messages} msgs</span>
                         <span class="model-stat">${m.tokens.toLocaleString()} tok</span>
-                        <span class="model-stat cost">$${m.cost.toFixed(4)}</span>
+                        <span class="model-stat cost">$${m.cost.toFixed(2)}</span>
                     </div>
                 `).join('');
                 
@@ -1058,7 +1058,7 @@ def generate_html():
                         <td>${p.messages.toLocaleString()}</td>
                         <td class="tokens">${p.tokens.toLocaleString()}</td>
                         <td style="color: var(--accent-purple)">${p.llm_time_display}</td>
-                        <td class="cost">$${p.cost.toFixed(4)}</td>
+                        <td class="cost">$${p.cost.toFixed(2)}</td>
                         <td style="color: var(--text-secondary)">${p.last_activity_display}</td>
                     </tr>
                     <tr class="model-breakdown" id="${rowId}">
@@ -1102,7 +1102,7 @@ def generate_html():
                         <td style="color: var(--accent-purple)">${s.llm_time_display}</td>
                         <td>${s.messages}</td>
                         <td class="tokens">${s.tokens.toLocaleString()}</td>
-                        <td class="cost">$${s.cost.toFixed(4)}</td>
+                        <td class="cost">$${s.cost.toFixed(2)}</td>
                         <td>
                             <button onclick="copyResumeCommand(decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
                             <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
