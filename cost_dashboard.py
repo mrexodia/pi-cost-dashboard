@@ -23,13 +23,13 @@ MANUAL_PRICING = {
     # Gemini models via Google Cloud Code Assist (free tier, but estimate value)
     # Pricing based on public Gemini API pricing as of Dec 2024
     "gemini-2.5-pro": {
-        "input": 1.25,      # $1.25 per 1M input tokens
-        "output": 10.00,    # $10.00 per 1M output tokens (with thinking)
-        "cache_read": 0.31, # $0.3125 per 1M cached tokens
+        "input": 1.25,  # $1.25 per 1M input tokens
+        "output": 10.00,  # $10.00 per 1M output tokens (with thinking)
+        "cache_read": 0.31,  # $0.3125 per 1M cached tokens
     },
     "gemini-2.5-flash": {
-        "input": 0.15,      # $0.15 per 1M input tokens
-        "output": 0.60,     # $0.60 per 1M output tokens
+        "input": 0.15,  # $0.15 per 1M input tokens
+        "output": 0.60,  # $0.60 per 1M output tokens
         "cache_read": 0.0375,
     },
     "gemini-2.0-flash": {
@@ -46,7 +46,9 @@ MANUAL_PRICING = {
 }
 
 
-def get_manual_cost(model: str, input_tokens: int, output_tokens: int, cache_read_tokens: int) -> float:
+def get_manual_cost(
+    model: str, input_tokens: int, output_tokens: int, cache_read_tokens: int
+) -> float:
     """Calculate cost using manual pricing if available."""
     for pattern, pricing in MANUAL_PRICING.items():
         if pattern in model.lower():
@@ -62,7 +64,7 @@ def parse_timestamp(ts):
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except:
         return None
 
@@ -81,12 +83,29 @@ def format_duration(seconds):
         return f"{hours}h{mins:02d}m" if mins else f"{hours}h"
 
 
+def calc_avg_tokens_per_sec(tps_samples):
+    """Calculate average tokens/second from samples.
+
+    Each sample is (output_tokens, llm_seconds, model).
+    Returns average tokens/second, or 0 if no valid samples.
+    """
+    if not tps_samples:
+        return 0.0
+
+    # Calculate tokens/sec for each sample and average them
+    tps_values = [tokens / secs for tokens, secs, _ in tps_samples if secs > 0]
+    if not tps_values:
+        return 0.0
+
+    return sum(tps_values) / len(tps_values)
+
+
 def get_project_path_from_jsonl(project_dir):
     """Get the actual project path from the first session file's cwd field."""
     jsonl_files = sorted(project_dir.glob("*.jsonl"))
     for filepath in jsonl_files:
         try:
-            with open(filepath, 'r') as f:
+            with open(filepath, "r") as f:
                 first_line = f.readline().strip()
                 if first_line:
                     data = json.loads(first_line)
@@ -107,18 +126,32 @@ def analyze_jsonl_file(filepath):
         "cache_write_tokens": 0,
         "total_tokens": 0,
         "cost_total": 0.0,
-        "models": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
+        "models": defaultdict(
+            lambda: {
+                "messages": 0,
+                "tokens": 0,
+                "cost": 0.0,
+                "llm_time": 0.0,
+                "output_tokens": 0,
+            }
+        ),
         "timestamps": [],
         "start": None,
         "end": None,
         "llm_time": 0.0,  # Total LLM working time in seconds
+        "tool_time": 0.0,  # Total tool execution time in seconds
+        "tools": defaultdict(
+            lambda: {"calls": 0, "time": 0.0, "errors": 0}
+        ),  # Per-tool stats
+        "tps_samples": [],  # List of (output_tokens, llm_seconds) per call for tokens/sec calculation
     }
-    
+
     last_request_ts = None  # Timestamp of last user message or toolResult
+    pending_tool_calls = {}  # tool_call_id -> {"name": str, "timestamp": datetime}
     cwd = ""
-    
+
     try:
-        with open(filepath, 'r') as f:
+        with open(filepath, "r") as f:
             # First, try to read cwd from the session line
             first_line = f.readline().strip()
             if first_line:
@@ -128,30 +161,48 @@ def analyze_jsonl_file(filepath):
                         cwd = session_data.get("cwd", "")
                 except:
                     pass
-            
+
             # Now process the rest of the file
             for line in f:
                 try:
                     data = json.loads(line.strip())
-                    if data.get("type") == "message" and "message" in data:
-                        msg = data["message"]
+                    if data.get("type") != "message" or "message" not in data:
+                        continue
+
+                    msg = data["message"]
+                    ts = parse_timestamp(data.get("timestamp"))
+                    role = msg.get("role")
+
+                    # Process assistant messages (with or without usage)
+                    if role == "assistant":
+                        # Calculate LLM time for this call
+                        llm_delta = 0
+                        if ts and last_request_ts:
+                            llm_delta = (ts - last_request_ts).total_seconds()
+                            if 0 < llm_delta < 300:  # Cap at 5 min to filter outliers
+                                stats["llm_time"] += llm_delta
+                            else:
+                                llm_delta = 0  # Invalid, don't use for tokens/sec
+                            last_request_ts = None
+
+                        # Process usage data if present
                         if "usage" in msg:
                             usage = msg["usage"]
                             cost = usage.get("cost", {})
                             model = msg.get("model", "unknown")
-                            
-                            # Calculate cost - use reported cost or manual pricing
+
                             input_tok = usage.get("input", 0)
                             output_tok = usage.get("output", 0)
                             cache_read_tok = usage.get("cacheRead", 0)
                             cache_write_tok = usage.get("cacheWrite", 0)
                             total_tok = usage.get("totalTokens", 0)
                             reported_cost = cost.get("total", 0)
-                            
-                            # If reported cost is 0, try manual pricing
+
                             if reported_cost == 0:
-                                reported_cost = get_manual_cost(model, input_tok, output_tok, cache_read_tok)
-                            
+                                reported_cost = get_manual_cost(
+                                    model, input_tok, output_tok, cache_read_tok
+                                )
+
                             stats["messages"] += 1
                             stats["input_tokens"] += input_tok
                             stats["output_tokens"] += output_tok
@@ -159,39 +210,74 @@ def analyze_jsonl_file(filepath):
                             stats["cache_write_tokens"] += cache_write_tok
                             stats["total_tokens"] += total_tok
                             stats["cost_total"] += reported_cost
-                            
+
                             stats["models"][model]["messages"] += 1
                             stats["models"][model]["tokens"] += total_tok
                             stats["models"][model]["cost"] += reported_cost
-                            
-                            ts = parse_timestamp(data.get("timestamp"))
+                            stats["models"][model]["output_tokens"] += output_tok
+
+                            # Track tokens/second sample if we have valid timing
+                            if llm_delta > 0 and output_tok > 0:
+                                stats["tps_samples"].append(
+                                    (output_tok, llm_delta, model)
+                                )
+                                stats["models"][model]["llm_time"] += llm_delta
+
                             if ts:
                                 stats["timestamps"].append(ts)
                                 if stats["start"] is None or ts < stats["start"]:
                                     stats["start"] = ts
                                 if stats["end"] is None or ts > stats["end"]:
                                     stats["end"] = ts
-                    
-                    # Track LLM working time (for all messages, not just ones with usage)
-                    if data.get("type") == "message" and "message" in data:
-                        ts = parse_timestamp(data.get("timestamp"))
+
+                        # Track tool calls from assistant messages
                         if ts:
-                            role = data["message"].get("role")
-                            if role == "assistant" and last_request_ts:
-                                llm_delta = (ts - last_request_ts).total_seconds()
-                                if 0 < llm_delta < 300:  # Cap at 5 min to filter outliers
-                                    stats["llm_time"] += llm_delta
-                                last_request_ts = None
-                            elif role == "user":
-                                last_request_ts = ts
-                            elif role == "toolResult":
-                                last_request_ts = ts
-                            
+                            content = msg.get("content", [])
+                            if isinstance(content, list):
+                                for item in content:
+                                    if (
+                                        isinstance(item, dict)
+                                        and item.get("type") == "toolCall"
+                                    ):
+                                        tool_id = item.get("id")
+                                        tool_name = item.get("name", "unknown")
+                                        if tool_id:
+                                            pending_tool_calls[tool_id] = {
+                                                "name": tool_name,
+                                                "timestamp": ts,
+                                            }
+
+                    elif role == "user":
+                        if ts:
+                            last_request_ts = ts
+
+                    elif role == "toolResult":
+                        if ts:
+                            last_request_ts = ts
+                            # Match tool result with pending call
+                            tool_call_id = msg.get("toolCallId")
+                            tool_name = msg.get("toolName", "unknown")
+                            is_error = msg.get("isError", False)
+
+                            if tool_call_id and tool_call_id in pending_tool_calls:
+                                call_info = pending_tool_calls.pop(tool_call_id)
+                                tool_delta = (
+                                    ts - call_info["timestamp"]
+                                ).total_seconds()
+                                if (
+                                    0 < tool_delta < 600
+                                ):  # Cap at 10 min to filter outliers
+                                    stats["tool_time"] += tool_delta
+                                    stats["tools"][tool_name]["calls"] += 1
+                                    stats["tools"][tool_name]["time"] += tool_delta
+                                    if is_error:
+                                        stats["tools"][tool_name]["errors"] += 1
+
                 except json.JSONDecodeError:
                     continue
     except Exception as e:
         print(f"Error reading {filepath}: {e}")
-    
+
     stats["cwd"] = cwd
     return stats
 
@@ -203,25 +289,41 @@ def analyze_project(project_dir):
         "sessions": [],
         "total_messages": 0,
         "total_tokens": 0,
+        "total_output_tokens": 0,
         "total_cost": 0.0,
         "total_llm_time": 0.0,
-        "models": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
+        "total_tool_time": 0.0,
+        "models": defaultdict(
+            lambda: {
+                "messages": 0,
+                "tokens": 0,
+                "cost": 0.0,
+                "llm_time": 0.0,
+                "output_tokens": 0,
+            }
+        ),
+        "tools": defaultdict(lambda: {"calls": 0, "time": 0.0, "errors": 0}),
         "daily_stats": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
         "first_activity": None,
         "last_activity": None,
+        "tps_samples": [],  # Aggregated tokens/sec samples
     }
 
     # Only get top-level JSONL files (not in subdirectories)
     jsonl_files = list(project_dir.glob("*.jsonl"))
     if not jsonl_files:
         return None
-    
+
     for filepath in sorted(jsonl_files):
         stats = analyze_jsonl_file(filepath)
         if stats["messages"] == 0:
             continue
 
-        duration = (stats["end"] - stats["start"]).total_seconds() if stats["start"] and stats["end"] else 0
+        duration = (
+            (stats["end"] - stats["start"]).total_seconds()
+            if stats["start"] and stats["end"]
+            else 0
+        )
 
         # Look for subagent sessions in a matching subdirectory
         # e.g., "session.jsonl" -> "session/" directory
@@ -234,43 +336,72 @@ def analyze_project(project_dir):
             for sub_jsonl in sorted(subagent_dir.rglob("*.jsonl")):
                 sub_stats = analyze_jsonl_file(sub_jsonl)
                 if sub_stats["messages"] > 0:
-                    sub_duration = (sub_stats["end"] - sub_stats["start"]).total_seconds() if sub_stats["start"] and sub_stats["end"] else 0
+                    sub_duration = (
+                        (sub_stats["end"] - sub_stats["start"]).total_seconds()
+                        if sub_stats["start"] and sub_stats["end"]
+                        else 0
+                    )
                     try:
                         sub_relative = sub_jsonl.relative_to(project_dir)
                     except ValueError:
                         sub_relative = sub_jsonl
 
-                    subagent_sessions.append({
-                        "file": sub_jsonl.name,
-                        "path": str(sub_jsonl),
-                        "relative_path": str(sub_relative),
-                        "cwd": sub_stats["cwd"],
-                        "messages": sub_stats["messages"],
-                        "tokens": sub_stats["total_tokens"],
-                        "cost": sub_stats["cost_total"],
-                        "start": sub_stats["start"],
-                        "end": sub_stats["end"],
-                        "duration": sub_duration,
-                        "llm_time": sub_stats["llm_time"],
-                    })
+                    subagent_sessions.append(
+                        {
+                            "file": sub_jsonl.name,
+                            "path": str(sub_jsonl),
+                            "relative_path": str(sub_relative),
+                            "cwd": sub_stats["cwd"],
+                            "messages": sub_stats["messages"],
+                            "tokens": sub_stats["total_tokens"],
+                            "output_tokens": sub_stats["output_tokens"],
+                            "cost": sub_stats["cost_total"],
+                            "start": sub_stats["start"],
+                            "end": sub_stats["end"],
+                            "duration": sub_duration,
+                            "llm_time": sub_stats["llm_time"],
+                            "tool_time": sub_stats["tool_time"],
+                            "tools": dict(sub_stats["tools"]),
+                            "avg_tps": calc_avg_tokens_per_sec(
+                                sub_stats["tps_samples"]
+                            ),
+                        }
+                    )
 
                     # Include subagent stats in project totals
                     project_stats["total_messages"] += sub_stats["messages"]
                     project_stats["total_tokens"] += sub_stats["total_tokens"]
+                    project_stats["total_output_tokens"] += sub_stats["output_tokens"]
                     project_stats["total_cost"] += sub_stats["cost_total"]
                     project_stats["total_llm_time"] += sub_stats["llm_time"]
+                    project_stats["total_tool_time"] += sub_stats["tool_time"]
+                    project_stats["tps_samples"].extend(sub_stats["tps_samples"])
 
                     # Track subagent model usage
                     for model, mstats in sub_stats["models"].items():
                         project_stats["models"][model]["messages"] += mstats["messages"]
                         project_stats["models"][model]["tokens"] += mstats["tokens"]
                         project_stats["models"][model]["cost"] += mstats["cost"]
+                        project_stats["models"][model]["llm_time"] += mstats.get(
+                            "llm_time", 0
+                        )
+                        project_stats["models"][model]["output_tokens"] += mstats.get(
+                            "output_tokens", 0
+                        )
+
+                    # Track subagent tool usage
+                    for tool_name, tstats in sub_stats["tools"].items():
+                        project_stats["tools"][tool_name]["calls"] += tstats["calls"]
+                        project_stats["tools"][tool_name]["time"] += tstats["time"]
+                        project_stats["tools"][tool_name]["errors"] += tstats["errors"]
 
                     # Track subagent daily stats
                     for ts in sub_stats["timestamps"]:
                         day_key = ts.strftime("%Y-%m-%d")
                         project_stats["daily_stats"][day_key]["messages"] += 1
-                        project_stats["daily_stats"][day_key]["cost"] += sub_stats["cost_total"] / max(len(sub_stats["timestamps"]), 1)
+                        project_stats["daily_stats"][day_key]["cost"] += sub_stats[
+                            "cost_total"
+                        ] / max(len(sub_stats["timestamps"]), 1)
 
         session = {
             "file": filepath.name,
@@ -279,67 +410,91 @@ def analyze_project(project_dir):
             "cwd": stats["cwd"],
             "messages": stats["messages"],
             "tokens": stats["total_tokens"],
+            "output_tokens": stats["output_tokens"],
             "cost": stats["cost_total"],
             "start": stats["start"],
             "end": stats["end"],
             "duration": duration,
             "llm_time": stats["llm_time"],
+            "tool_time": stats["tool_time"],
+            "tools": dict(stats["tools"]),
+            "avg_tps": calc_avg_tokens_per_sec(stats["tps_samples"]),
             "subagent_sessions": subagent_sessions,  # List of nested sessions
         }
         project_stats["sessions"].append(session)
-        
+
         project_stats["total_messages"] += stats["messages"]
         project_stats["total_tokens"] += stats["total_tokens"]
+        project_stats["total_output_tokens"] += stats["output_tokens"]
         project_stats["total_cost"] += stats["cost_total"]
         project_stats["total_llm_time"] += stats["llm_time"]
-        
+        project_stats["total_tool_time"] += stats["tool_time"]
+        project_stats["tps_samples"].extend(stats["tps_samples"])
+
         for model, mstats in stats["models"].items():
             project_stats["models"][model]["messages"] += mstats["messages"]
             project_stats["models"][model]["tokens"] += mstats["tokens"]
             project_stats["models"][model]["cost"] += mstats["cost"]
-        
+            project_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
+            project_stats["models"][model]["output_tokens"] += mstats.get(
+                "output_tokens", 0
+            )
+
+        for tool_name, tstats in stats["tools"].items():
+            project_stats["tools"][tool_name]["calls"] += tstats["calls"]
+            project_stats["tools"][tool_name]["time"] += tstats["time"]
+            project_stats["tools"][tool_name]["errors"] += tstats["errors"]
+
         for ts in stats["timestamps"]:
             day_key = ts.strftime("%Y-%m-%d")
             project_stats["daily_stats"][day_key]["messages"] += 1
-            project_stats["daily_stats"][day_key]["cost"] += stats["cost_total"] / max(len(stats["timestamps"]), 1)
-        
+            project_stats["daily_stats"][day_key]["cost"] += stats["cost_total"] / max(
+                len(stats["timestamps"]), 1
+            )
+
         if stats["start"]:
-            if project_stats["first_activity"] is None or stats["start"] < project_stats["first_activity"]:
+            if (
+                project_stats["first_activity"] is None
+                or stats["start"] < project_stats["first_activity"]
+            ):
                 project_stats["first_activity"] = stats["start"]
         if stats["end"]:
-            if project_stats["last_activity"] is None or stats["end"] > project_stats["last_activity"]:
+            if (
+                project_stats["last_activity"] is None
+                or stats["end"] > project_stats["last_activity"]
+            ):
                 project_stats["last_activity"] = stats["end"]
-    
+
     return project_stats if project_stats["sessions"] else None
 
 
 def export_session_to_html(session_path: str) -> str:
     """Export a session file to HTML using pi --export."""
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     # Create a unique output filename based on the session path
-    session_hash = hash(session_path) & 0xffffffff
+    session_hash = hash(session_path) & 0xFFFFFFFF
     output_file = TEMP_DIR / f"session_{session_hash}.html"
-    
+
     try:
         result = subprocess.run(
             ["pi", "--export", session_path, str(output_file)],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
         )
         if result.returncode == 0 and output_file.exists():
             return output_file.read_text()
     except Exception as e:
         return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(str(e))}</pre></body></html>"
-    
+
     return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(result.stderr)}</pre></body></html>"
 
 
 def get_session_cwd(session_path: str) -> str:
     """Get the working directory from a session file."""
     try:
-        with open(session_path, 'r') as f:
+        with open(session_path, "r") as f:
             first_line = f.readline().strip()
             if first_line:
                 data = json.loads(first_line)
@@ -357,7 +512,7 @@ def get_all_sessions():
         return sessions
 
     for project_dir in SESSIONS_DIR.iterdir():
-        if not project_dir.is_dir() or project_dir.name.startswith('.'):
+        if not project_dir.is_dir() or project_dir.name.startswith("."):
             continue
 
         project_name = get_project_path_from_jsonl(project_dir)
@@ -380,31 +535,35 @@ def get_all_sessions():
                             except ValueError:
                                 sub_relative = sub_jsonl.name
 
-                            sessions.append({
-                                "project": project_name,
-                                "file": sub_jsonl.name,
-                                "path": str(sub_jsonl),
-                                "relative_path": str(sub_relative),
-                                "cwd": get_session_cwd(str(sub_jsonl)),
-                                "messages": sub_stats["messages"],
-                                "tokens": sub_stats["total_tokens"],
-                                "cost": sub_stats["cost_total"],
-                                "start": sub_stats["start"],
-                                "end": sub_stats["end"],
-                            })
+                            sessions.append(
+                                {
+                                    "project": project_name,
+                                    "file": sub_jsonl.name,
+                                    "path": str(sub_jsonl),
+                                    "relative_path": str(sub_relative),
+                                    "cwd": get_session_cwd(str(sub_jsonl)),
+                                    "messages": sub_stats["messages"],
+                                    "tokens": sub_stats["total_tokens"],
+                                    "cost": sub_stats["cost_total"],
+                                    "start": sub_stats["start"],
+                                    "end": sub_stats["end"],
+                                }
+                            )
 
-                sessions.append({
-                    "project": project_name,
-                    "file": filepath.name,
-                    "path": str(filepath),
-                    "relative_path": filepath.name,
-                    "cwd": get_session_cwd(str(filepath)),
-                    "messages": stats["messages"],
-                    "tokens": stats["total_tokens"],
-                    "cost": stats["cost_total"],
-                    "start": stats["start"],
-                    "end": stats["end"],
-                })
+                sessions.append(
+                    {
+                        "project": project_name,
+                        "file": filepath.name,
+                        "path": str(filepath),
+                        "relative_path": filepath.name,
+                        "cwd": get_session_cwd(str(filepath)),
+                        "messages": stats["messages"],
+                        "tokens": stats["total_tokens"],
+                        "cost": stats["cost_total"],
+                        "start": stats["start"],
+                        "end": stats["end"],
+                    }
+                )
 
     return sessions
 
@@ -415,50 +574,74 @@ def collect_all_stats():
     global_stats = {
         "total_cost": 0.0,
         "total_tokens": 0,
+        "total_output_tokens": 0,
         "total_messages": 0,
         "total_sessions": 0,
         "total_projects": 0,
         "total_llm_time": 0.0,
-        "models": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
+        "total_tool_time": 0.0,
+        "models": defaultdict(
+            lambda: {
+                "messages": 0,
+                "tokens": 0,
+                "cost": 0.0,
+                "llm_time": 0.0,
+                "output_tokens": 0,
+            }
+        ),
+        "tools": defaultdict(lambda: {"calls": 0, "time": 0.0, "errors": 0}),
         "daily_stats": defaultdict(lambda: {"messages": 0, "cost": 0.0}),
+        "tps_samples": [],
     }
-    
+
     if not SESSIONS_DIR.exists():
         return all_projects, global_stats
-    
+
     for project_dir in SESSIONS_DIR.iterdir():
-        if not project_dir.is_dir() or project_dir.name.startswith('.'):
+        if not project_dir.is_dir() or project_dir.name.startswith("."):
             continue
-        
+
         project_stats = analyze_project(project_dir)
         if project_stats:
             all_projects.append(project_stats)
             global_stats["total_cost"] += project_stats["total_cost"]
             global_stats["total_tokens"] += project_stats["total_tokens"]
+            global_stats["total_output_tokens"] += project_stats["total_output_tokens"]
             global_stats["total_messages"] += project_stats["total_messages"]
             global_stats["total_sessions"] += len(project_stats["sessions"])
             global_stats["total_projects"] += 1
             global_stats["total_llm_time"] += project_stats["total_llm_time"]
-            
+            global_stats["total_tool_time"] += project_stats["total_tool_time"]
+            global_stats["tps_samples"].extend(project_stats["tps_samples"])
+
             for model, mstats in project_stats["models"].items():
                 global_stats["models"][model]["messages"] += mstats["messages"]
                 global_stats["models"][model]["tokens"] += mstats["tokens"]
                 global_stats["models"][model]["cost"] += mstats["cost"]
-            
+                global_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
+                global_stats["models"][model]["output_tokens"] += mstats.get(
+                    "output_tokens", 0
+                )
+
+            for tool_name, tstats in project_stats["tools"].items():
+                global_stats["tools"][tool_name]["calls"] += tstats["calls"]
+                global_stats["tools"][tool_name]["time"] += tstats["time"]
+                global_stats["tools"][tool_name]["errors"] += tstats["errors"]
+
             for day, dstats in project_stats["daily_stats"].items():
                 global_stats["daily_stats"][day]["messages"] += dstats["messages"]
                 global_stats["daily_stats"][day]["cost"] += dstats["cost"]
-    
+
     return all_projects, global_stats
 
 
 def generate_html():
     """Generate HTML dashboard."""
     all_projects, global_stats = collect_all_stats()
-    
+
     # Sort projects by cost for initial display
     all_projects.sort(key=lambda p: -p["total_cost"])
-    
+
     # Build projects JSON for client-side sorting
     projects_json = []
     for p in all_projects:
@@ -472,65 +655,127 @@ def generate_html():
             for sub in s.get("subagent_sessions", []):
                 sub_duration = sub["duration"] if sub["duration"] else 0
                 sub_llm = sub["llm_time"] if sub["llm_time"] else 0
-                sub_sessions_json.append({
-                    "file": sub["file"],
-                    "path": sub["path"],
-                    "relative_path": sub["relative_path"],
-                    "cwd": sub["cwd"],
-                    "messages": sub["messages"],
-                    "tokens": sub["tokens"],
-                    "cost": sub["cost"],
-                    "start": sub["start"].isoformat() if sub["start"] else "",
-                    "start_display": sub["start"].strftime("%Y-%m-%d %H:%M") if sub["start"] else "N/A",
-                    "end": sub["end"].isoformat() if sub["end"] else "",
-                    "duration": sub_duration,
-                    "duration_display": format_duration(sub_duration),
-                    "llm_time": sub_llm,
-                    "llm_time_display": format_duration(sub_llm),
-                })
+                sub_tool = sub.get("tool_time", 0) if sub.get("tool_time") else 0
+                sub_tps = sub.get("avg_tps", 0)
+                sub_sessions_json.append(
+                    {
+                        "file": sub["file"],
+                        "path": sub["path"],
+                        "relative_path": sub["relative_path"],
+                        "cwd": sub["cwd"],
+                        "messages": sub["messages"],
+                        "tokens": sub["tokens"],
+                        "cost": sub["cost"],
+                        "start": sub["start"].isoformat() if sub["start"] else "",
+                        "start_display": sub["start"].strftime("%Y-%m-%d %H:%M")
+                        if sub["start"]
+                        else "N/A",
+                        "end": sub["end"].isoformat() if sub["end"] else "",
+                        "duration": sub_duration,
+                        "duration_display": format_duration(sub_duration),
+                        "llm_time": sub_llm,
+                        "llm_time_display": format_duration(sub_llm),
+                        "tool_time": sub_tool,
+                        "tool_time_display": format_duration(sub_tool),
+                        "avg_tps": sub_tps,
+                    }
+                )
 
-            sessions_json.append({
-                "file": s["file"],
-                "path": s["path"],
-                "relative_path": s.get("relative_path", s["file"]),
-                "cwd": s["cwd"],
-                "messages": s["messages"],
-                "tokens": s["tokens"],
-                "cost": s["cost"],
-                "start": s["start"].isoformat() if s["start"] else "",
-                "start_display": s["start"].strftime("%Y-%m-%d %H:%M") if s["start"] else "N/A",
-                "end": s["end"].isoformat() if s["end"] else "",
-                "duration": duration_secs,
-                "duration_display": format_duration(duration_secs),
-                "llm_time": llm_secs,
-                "llm_time_display": format_duration(llm_secs),
-                "subagent_sessions": sub_sessions_json,
-            })
+            tool_secs = s.get("tool_time", 0) if s.get("tool_time") else 0
+            session_tps = s.get("avg_tps", 0)
+            sessions_json.append(
+                {
+                    "file": s["file"],
+                    "path": s["path"],
+                    "relative_path": s.get("relative_path", s["file"]),
+                    "cwd": s["cwd"],
+                    "messages": s["messages"],
+                    "tokens": s["tokens"],
+                    "cost": s["cost"],
+                    "start": s["start"].isoformat() if s["start"] else "",
+                    "start_display": s["start"].strftime("%Y-%m-%d %H:%M")
+                    if s["start"]
+                    else "N/A",
+                    "end": s["end"].isoformat() if s["end"] else "",
+                    "duration": duration_secs,
+                    "duration_display": format_duration(duration_secs),
+                    "llm_time": llm_secs,
+                    "llm_time_display": format_duration(llm_secs),
+                    "tool_time": tool_secs,
+                    "tool_time_display": format_duration(tool_secs),
+                    "avg_tps": session_tps,
+                    "subagent_sessions": sub_sessions_json,
+                }
+            )
         # Build model breakdown for this project
         models_list = []
-        for model_name, mstats in sorted(p["models"].items(), key=lambda x: -x[1]["cost"]):
-            models_list.append({
-                "name": model_name,
-                "messages": mstats["messages"],
-                "tokens": mstats["tokens"],
-                "cost": mstats["cost"],
-            })
-        
-        projects_json.append({
-            "name": p["name"],
-            "sessions": len(p["sessions"]),
-            "sessions_list": sessions_json,
-            "messages": p["total_messages"],
-            "tokens": p["total_tokens"],
-            "cost": p["total_cost"],
-            "llm_time": p["total_llm_time"],
-            "llm_time_display": format_duration(p["total_llm_time"]),
-            "last_activity": p["last_activity"].isoformat() if p["last_activity"] else "",
-            "last_activity_display": p["last_activity"].strftime("%Y-%m-%d %H:%M") if p["last_activity"] else "N/A",
-            "models": models_list,
-        })
-    
-    html_content = f'''<!DOCTYPE html>
+        for model_name, mstats in sorted(
+            p["models"].items(), key=lambda x: -x[1]["cost"]
+        ):
+            model_tps = (
+                mstats.get("output_tokens", 0) / mstats.get("llm_time", 1)
+                if mstats.get("llm_time", 0) > 0
+                else 0
+            )
+            models_list.append(
+                {
+                    "name": model_name,
+                    "messages": mstats["messages"],
+                    "tokens": mstats["tokens"],
+                    "cost": mstats["cost"],
+                    "avg_tps": model_tps,
+                }
+            )
+
+        # Build tool breakdown for this project
+        tools_list = []
+        for tool_name, tstats in sorted(
+            p["tools"].items(), key=lambda x: -x[1]["time"]
+        ):
+            tools_list.append(
+                {
+                    "name": tool_name,
+                    "calls": tstats["calls"],
+                    "time": tstats["time"],
+                    "time_display": format_duration(tstats["time"]),
+                    "errors": tstats["errors"],
+                    "avg_time": tstats["time"] / tstats["calls"]
+                    if tstats["calls"] > 0
+                    else 0,
+                    "avg_time_display": format_duration(
+                        tstats["time"] / tstats["calls"]
+                    )
+                    if tstats["calls"] > 0
+                    else "0s",
+                }
+            )
+
+        project_avg_tps = calc_avg_tokens_per_sec(p["tps_samples"])
+        projects_json.append(
+            {
+                "name": p["name"],
+                "sessions": len(p["sessions"]),
+                "sessions_list": sessions_json,
+                "messages": p["total_messages"],
+                "tokens": p["total_tokens"],
+                "cost": p["total_cost"],
+                "llm_time": p["total_llm_time"],
+                "llm_time_display": format_duration(p["total_llm_time"]),
+                "tool_time": p["total_tool_time"],
+                "tool_time_display": format_duration(p["total_tool_time"]),
+                "avg_tps": project_avg_tps,
+                "last_activity": p["last_activity"].isoformat()
+                if p["last_activity"]
+                else "",
+                "last_activity_display": p["last_activity"].strftime("%Y-%m-%d %H:%M")
+                if p["last_activity"]
+                else "N/A",
+                "models": models_list,
+                "tools": tools_list,
+            }
+        )
+
+    html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -960,11 +1205,19 @@ def generate_html():
             </div>
             <div class="stat-card">
                 <div class="label">Total Tokens</div>
-                <div class="value">{global_stats["total_tokens"]/1_000_000:.1f}M</div>
+                <div class="value">{global_stats["total_tokens"] / 1_000_000:.1f}M</div>
             </div>
             <div class="stat-card">
                 <div class="label">LLM Time</div>
                 <div class="value" style="color: var(--accent-purple)">{format_duration(global_stats["total_llm_time"])}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Tool Time</div>
+                <div class="value" style="color: var(--accent-yellow)">{format_duration(global_stats["total_tool_time"])}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Avg Tokens/s</div>
+                <div class="value" style="color: var(--accent-blue)">{calc_avg_tokens_per_sec(global_stats["tps_samples"]):.1f}</div>
             </div>
         </div>
         
@@ -973,15 +1226,15 @@ def generate_html():
                 <span>📊 Daily Spending</span>
             </div>
             <div class="daily-chart">
-'''
-    
+"""
+
     # Daily chart
     if global_stats["daily_stats"]:
         max_daily = max(d["cost"] for d in global_stats["daily_stats"].values())
         for day in sorted(global_stats["daily_stats"].keys())[-14:]:
             stats = global_stats["daily_stats"][day]
             pct = (stats["cost"] / max_daily * 100) if max_daily > 0 else 0
-            html_content += f'''
+            html_content += f"""
                 <div class="daily-bar">
                     <span class="date">{day}</span>
                     <div class="bar-wrapper">
@@ -991,9 +1244,9 @@ def generate_html():
                     </div>
                     <span class="amount">${stats["cost"]:.2f}</span>
                 </div>
-'''
-    
-    html_content += '''
+"""
+
+    html_content += """
             </div>
         </div>
         
@@ -1007,21 +1260,35 @@ def generate_html():
                         <th>Model</th>
                         <th>Messages</th>
                         <th>Tokens</th>
+                        <th>Avg Tokens/s</th>
                         <th>Cost</th>
                         <th>% of Total</th>
                     </tr>
                 </thead>
                 <tbody>
-'''
-    
-    for model, mstats in sorted(global_stats["models"].items(), key=lambda x: -x[1]["cost"]):
-        pct = (mstats["cost"] / global_stats["total_cost"] * 100) if global_stats["total_cost"] > 0 else 0
+"""
+
+    for model, mstats in sorted(
+        global_stats["models"].items(), key=lambda x: -x[1]["cost"]
+    ):
+        pct = (
+            (mstats["cost"] / global_stats["total_cost"] * 100)
+            if global_stats["total_cost"] > 0
+            else 0
+        )
         model_class = "model-claude" if "claude" in model.lower() else "model-other"
-        html_content += f'''
+        # Calculate tokens/second for this model
+        model_tps = (
+            mstats["output_tokens"] / mstats["llm_time"]
+            if mstats.get("llm_time", 0) > 0
+            else 0
+        )
+        html_content += f"""
                     <tr>
                         <td><span class="model-tag {model_class}">{html.escape(model)}</span></td>
                         <td>{mstats["messages"]:,}</td>
                         <td class="tokens">{mstats["tokens"]:,}</td>
+                        <td style="color: var(--accent-blue)">{model_tps:.1f}</td>
                         <td class="cost">${mstats["cost"]:.2f}</td>
                         <td>
                             <div class="bar-container" style="width: 100px; display: inline-block; vertical-align: middle;">
@@ -1030,9 +1297,60 @@ def generate_html():
                             {pct:.1f}%
                         </td>
                     </tr>
+"""
+
+    html_content += """
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <span>🔧 Tools Used</span>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Tool</th>
+                        <th>Calls</th>
+                        <th>Total Time</th>
+                        <th>Avg Time</th>
+                        <th>Errors</th>
+                        <th>% of Time</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+
+    total_tool_time = global_stats["total_tool_time"]
+    for tool_name, tstats in sorted(
+        global_stats["tools"].items(), key=lambda x: -x[1]["time"]
+    ):
+        pct = (tstats["time"] / total_tool_time * 100) if total_tool_time > 0 else 0
+        avg_time = tstats["time"] / tstats["calls"] if tstats["calls"] > 0 else 0
+        error_style = (
+            "color: var(--accent-red)"
+            if tstats["errors"] > 0
+            else "color: var(--text-secondary)"
+        )
+        html_content += f'''
+                    <tr>
+                        <td><span class="model-tag model-other">{html.escape(tool_name)}</span></td>
+                        <td>{tstats["calls"]:,}</td>
+                        <td style="color: var(--accent-yellow)">{format_duration(tstats["time"])}</td>
+                        <td style="color: var(--text-secondary)">{format_duration(avg_time)}</td>
+                        <td style="{error_style}">{tstats["errors"]}</td>
+                        <td>
+                            <div class="bar-container" style="width: 100px; display: inline-block; vertical-align: middle;">
+                                <div class="bar" style="width: {pct}%; background: var(--accent-yellow)"></div>
+                            </div>
+                            {pct:.1f}%
+                        </td>
+                    </tr>
 '''
-    
-    html_content += '''
+
+    html_content += (
+        """
                 </tbody>
             </table>
         </div>
@@ -1040,7 +1358,9 @@ def generate_html():
         <div class="section">
             <div class="section-header">
                 <span>📁 Projects</span>
-                <span class="badge">''' + str(len(all_projects)) + ''' projects</span>
+                <span class="badge">"""
+        + str(len(all_projects))
+        + """ projects</span>
             </div>
             <table id="projects-table">
                 <thead>
@@ -1050,6 +1370,8 @@ def generate_html():
                         <th data-sort="messages">Messages <span class="sort-icon">▼</span></th>
                         <th data-sort="tokens">Tokens <span class="sort-icon">▼</span></th>
                         <th data-sort="llm_time">LLM Time <span class="sort-icon">▼</span></th>
+                        <th data-sort="tool_time">Tool Time <span class="sort-icon">▼</span></th>
+                        <th data-sort="avg_tps">Tok/s <span class="sort-icon">▼</span></th>
                         <th data-sort="cost">Cost <span class="sort-icon">▼</span></th>
                         <th data-sort="last_activity">Last Activity <span class="sort-icon">▼</span></th>
                     </tr>
@@ -1071,6 +1393,8 @@ def generate_html():
                         <th data-sort="start">Date <span class="sort-icon">▼</span></th>
                         <th data-sort="duration">Duration <span class="sort-icon">▼</span></th>
                         <th data-sort="llm_time">LLM Time <span class="sort-icon">▼</span></th>
+                        <th data-sort="tool_time">Tool Time <span class="sort-icon">▼</span></th>
+                        <th data-sort="avg_tps">Tok/s <span class="sort-icon">▼</span></th>
                         <th data-sort="messages">Messages <span class="sort-icon">▼</span></th>
                         <th data-sort="tokens">Tokens <span class="sort-icon">▼</span></th>
                         <th data-sort="cost">Cost <span class="sort-icon">▼</span></th>
@@ -1088,7 +1412,9 @@ def generate_html():
     </div>
     
     <script>
-        const projects = ''' + json.dumps(projects_json) + ''';
+        const projects = """
+        + json.dumps(projects_json)
+        + """;
 
         function formatDuration(seconds) {
             if (seconds < 60) {
@@ -1165,7 +1491,19 @@ def generate_html():
                         <span class="model-name">${escapeHtml(m.name)}</span>
                         <span class="model-stat">${m.messages} msgs</span>
                         <span class="model-stat">${m.tokens.toLocaleString()} tok</span>
+                        <span class="model-stat" style="color: var(--accent-blue)">${(m.avg_tps || 0).toFixed(1)} tok/s</span>
                         <span class="model-stat cost">$${m.cost.toFixed(2)}</span>
+                    </div>
+                `).join('');
+                
+                // Build tool breakdown HTML
+                const toolRows = (p.tools || []).map(t => `
+                    <div class="model-item">
+                        <span class="model-name" style="color: var(--accent-yellow)">${escapeHtml(t.name)}</span>
+                        <span class="model-stat">${t.calls} calls</span>
+                        <span class="model-stat" style="color: var(--accent-yellow)">${t.time_display}</span>
+                        <span class="model-stat">avg ${t.avg_time_display}</span>
+                        ${t.errors > 0 ? `<span class="model-stat" style="color: var(--accent-red)">${t.errors} errors</span>` : ''}
                     </div>
                 `).join('');
                 
@@ -1176,13 +1514,17 @@ def generate_html():
                         <td>${p.messages.toLocaleString()}</td>
                         <td class="tokens">${p.tokens.toLocaleString()}</td>
                         <td style="color: var(--accent-purple)">${p.llm_time_display}</td>
+                        <td style="color: var(--accent-yellow)">${p.tool_time_display}</td>
+                        <td style="color: var(--accent-blue)">${(p.avg_tps || 0).toFixed(1)}</td>
                         <td class="cost">$${p.cost.toFixed(2)}</td>
                         <td style="color: var(--text-secondary)">${p.last_activity_display}</td>
                     </tr>
                     <tr class="model-breakdown" id="${rowId}">
-                        <td colspan="7">
+                        <td colspan="9">
                             <div class="model-tree">
+                                <div style="font-weight: 600; margin-bottom: 8px; color: var(--text-secondary)">Models:</div>
                                 ${modelRows || '<div style="color: var(--text-secondary)">No model data</div>'}
+                                ${toolRows ? `<div style="font-weight: 600; margin: 12px 0 8px 0; color: var(--text-secondary)">Tools:</div>${toolRows}` : ''}
                             </div>
                         </td>
                     </tr>
@@ -1239,6 +1581,8 @@ def generate_html():
                             <td style="color: var(--text-secondary)">${s.start_display}</td>
                             <td style="color: var(--text-secondary)">${s.duration_display}</td>
                             <td style="color: var(--accent-purple)">${s.llm_time_display}</td>
+                            <td style="color: var(--accent-yellow)">${s.tool_time_display || '0s'}</td>
+                            <td style="color: var(--accent-blue)">${(s.avg_tps || 0).toFixed(1)}</td>
                             <td>${s.messages.toLocaleString()}</td>
                             <td class="tokens">${s.tokens.toLocaleString()}</td>
                             <td class="cost">$${s.cost.toFixed(2)}</td>
@@ -1261,6 +1605,7 @@ def generate_html():
                 const aggTokens = allSessionsInGroup.reduce((sum, session) => sum + session.tokens, 0);
                 const aggMessages = allSessionsInGroup.reduce((sum, session) => sum + session.messages, 0);
                 const aggLlmTime = allSessionsInGroup.reduce((sum, session) => sum + (session.llm_time || 0), 0);
+                const aggToolTime = allSessionsInGroup.reduce((sum, session) => sum + (session.tool_time || 0), 0);
 
                 // Get earliest start and latest end
                 const starts = allSessionsInGroup.map(session => session.start).filter(Boolean);
@@ -1280,6 +1625,10 @@ def generate_html():
                 const resumeCmd = 'cd "' + s.cwd + '" && pi --session "' + resumePath + '"';
                 const encodedCmd = encodeURIComponent(resumeCmd);
 
+                // Calculate average tokens/sec for aggregated sessions
+                const tpsValues = allSessionsInGroup.map(session => session.avg_tps || 0).filter(v => v > 0);
+                const aggAvgTps = tpsValues.length > 0 ? tpsValues.reduce((a, b) => a + b, 0) / tpsValues.length : 0;
+
                 html += `
                     <tr class="expandable-row" data-target="${projectId}" onclick="toggleProjectRow('${projectId}')">
                         <td class="project-name" title="${escapeHtml(s.cwd)}">
@@ -1289,6 +1638,8 @@ def generate_html():
                         <td style="color: var(--text-secondary)">${dateDisplay}</td>
                         <td style="color: var(--text-secondary)">${formatDuration(totalDuration)}</td>
                         <td style="color: var(--accent-purple)">${formatDuration(aggLlmTime)}</td>
+                        <td style="color: var(--accent-yellow)">${formatDuration(aggToolTime)}</td>
+                        <td style="color: var(--accent-blue)">${aggAvgTps.toFixed(1)}</td>
                         <td>${aggMessages.toLocaleString()}</td>
                         <td class="tokens">${aggTokens.toLocaleString()}</td>
                         <td class="cost">$${aggCost.toFixed(2)}</td>
@@ -1298,7 +1649,7 @@ def generate_html():
                         </td>
                     </tr>
                     <tr class="model-breakdown" id="${projectId}">
-                        <td colspan="8" style="padding: 0">
+                        <td colspan="10" style="padding: 0">
                             <div class="model-tree">
                 `;
 
@@ -1311,6 +1662,8 @@ def generate_html():
                         <span class="model-stat">${s.start_display}</span>
                         <span class="model-stat">${s.duration_display}</span>
                         <span class="model-stat" style="color: var(--accent-purple)">${s.llm_time_display}</span>
+                        <span class="model-stat" style="color: var(--accent-yellow)">${s.tool_time_display || '0s'}</span>
+                        <span class="model-stat" style="color: var(--accent-blue)">${(s.avg_tps || 0).toFixed(1)} tok/s</span>
                         <span class="model-stat">${s.messages} msgs</span>
                         <span class="model-stat">${s.tokens.toLocaleString()} tok</span>
                         <span class="model-stat cost">$${s.cost.toFixed(2)}</span>
@@ -1339,6 +1692,8 @@ def generate_html():
                             <span class="model-stat">${sub.start_display}</span>
                             <span class="model-stat">${sub.duration_display}</span>
                             <span class="model-stat" style="color: var(--accent-purple)">${sub.llm_time_display}</span>
+                            <span class="model-stat" style="color: var(--accent-yellow)">${sub.tool_time_display || '0s'}</span>
+                            <span class="model-stat" style="color: var(--accent-blue)">${(sub.avg_tps || 0).toFixed(1)} tok/s</span>
                             <span class="model-stat">${sub.messages} msgs</span>
                             <span class="model-stat">${sub.tokens.toLocaleString()} tok</span>
                             <span class="model-stat cost">$${sub.cost.toFixed(2)}</span>
@@ -1419,50 +1774,55 @@ def generate_html():
     </script>
 </body>
 </html>
-'''
-    
+"""
+    )
+
     return html_content
 
 
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for the dashboard."""
-    
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
-        
-        if parsed.path == '/' or parsed.path == '/index.html':
+
+        if parsed.path == "/" or parsed.path == "/index.html":
             self.send_response(200)
-            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.send_header("Content-type", "text/html; charset=utf-8")
             self.end_headers()
             html_content = generate_html()
-            self.wfile.write(html_content.encode('utf-8'))
-        
-        elif parsed.path == '/session':
-            session_path = query.get('path', [None])[0]
+            self.wfile.write(html_content.encode("utf-8"))
+
+        elif parsed.path == "/session":
+            session_path = query.get("path", [None])[0]
             if session_path and Path(session_path).exists():
                 self.send_response(200)
-                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
                 html_content = export_session_to_html(session_path)
-                self.wfile.write(html_content.encode('utf-8'))
+                self.wfile.write(html_content.encode("utf-8"))
             else:
                 self.send_response(404)
-                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(b'<html><body><h1>Session not found</h1></body></html>')
-        
+                self.wfile.write(
+                    b"<html><body><h1>Session not found</h1></body></html>"
+                )
+
         else:
             self.send_response(404)
             self.end_headers()
-    
+
     def log_message(self, format, *args):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {args[0]}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Pi Agent Cost Dashboard Server')
-    parser.add_argument('-p', '--port', type=int, default=8080, help='Port to serve on (default: 8080)')
+    parser = argparse.ArgumentParser(description="Pi Agent Cost Dashboard Server")
+    parser.add_argument(
+        "-p", "--port", type=int, default=8080, help="Port to serve on (default: 8080)"
+    )
     args = parser.parse_args()
 
     # Check if sessions directory exists
