@@ -5,7 +5,7 @@ import json
 import glob
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
 
 def parse_timestamp(ts):
@@ -15,7 +15,7 @@ def parse_timestamp(ts):
     try:
         # Handle formats like "2025-12-25T23:03:53.010Z"
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except:
+    except (ValueError, TypeError):
         return None
 
 
@@ -158,7 +158,7 @@ def analyze_jsonl_files():
         last_ts = max(all_timestamps)
         total_span = (last_ts - first_ts).total_seconds()
 
-        print(f"\n⏱️  TIME PERIOD:")
+        print("\n⏱️  TIME PERIOD:")
         print(f"   First activity:  {first_ts.strftime('%Y-%m-%d %H:%M:%S')} UTC")
         print(f"   Last activity:   {last_ts.strftime('%Y-%m-%d %H:%M:%S')} UTC")
         print(f"   Total span:      {format_duration(total_span)}")
@@ -166,23 +166,23 @@ def analyze_jsonl_files():
             cost_per_hour = total_stats["cost_total"] / (total_span / 3600)
             print(f"   Avg cost/hour:   ${cost_per_hour:.2f}")
 
-    print(f"\n📊 TOKEN USAGE:")
+    print("\n📊 TOKEN USAGE:")
     print(f"   Input tokens:       {total_stats['input_tokens']:>12,}")
     print(f"   Output tokens:      {total_stats['output_tokens']:>12,}")
     print(f"   Cache read tokens:  {total_stats['cache_read_tokens']:>12,}")
     print(f"   Cache write tokens: {total_stats['cache_write_tokens']:>12,}")
     print(f"   Total tokens:       {total_stats['total_tokens']:>12,}")
 
-    print(f"\n💰 COSTS:")
+    print("\n💰 COSTS:")
     print(f"   Input cost:         ${total_stats['cost_input']:>10.4f}")
     print(f"   Output cost:        ${total_stats['cost_output']:>10.4f}")
     print(f"   Cache read cost:    ${total_stats['cost_cache_read']:>10.4f}")
     print(f"   Cache write cost:   ${total_stats['cost_cache_write']:>10.4f}")
-    print(f"   ─────────────────────────────")
+    print("   ─────────────────────────────")
     print(f"   TOTAL COST:         ${total_stats['cost_total']:>10.4f}")
 
     if model_stats:
-        print(f"\n🤖 BY MODEL:")
+        print("\n🤖 BY MODEL:")
         for model, stats in sorted(model_stats.items(), key=lambda x: -x[1]["cost"]):
             print(f"   {model}:")
             print(
@@ -190,14 +190,14 @@ def analyze_jsonl_files():
             )
 
     if daily_stats:
-        print(f"\n📅 BY DAY:")
+        print("\n📅 BY DAY:")
         for day, stats in sorted(daily_stats.items()):
             print(
                 f"   {day}:  ${stats['cost']:>8.4f}  ({stats['messages']:>4} msgs, {stats['tokens']:>10,} tokens)"
             )
 
     if hourly_stats:
-        print(f"\n🕐 BY HOUR (UTC):")
+        print("\n🕐 BY HOUR (UTC):")
         # Show as a simple bar chart
         max_cost = max(s["cost"] for s in hourly_stats.values()) if hourly_stats else 1
         for hour in range(24):
@@ -207,7 +207,7 @@ def analyze_jsonl_files():
                 bar = "█" * bar_len
                 print(f"   {hour:02d}:00  ${stats['cost']:>7.2f}  {bar}")
 
-    print(f"\n📄 BY SESSION:")
+    print("\n📄 BY SESSION:")
     for fs in sorted(file_stats, key=lambda x: -x["cost"]):
         duration_str = format_duration(fs["duration"]) if fs["duration"] else "n/a"
         start_str = fs["start"].strftime("%m-%d %H:%M") if fs["start"] else ""

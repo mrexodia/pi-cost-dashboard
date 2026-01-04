@@ -2,7 +2,6 @@
 """Serve a dynamic HTML dashboard with cost statistics for all pi-agent sessions."""
 
 import json
-import os
 import subprocess
 import tempfile
 import urllib.parse
@@ -13,6 +12,99 @@ import html
 import http.server
 import socketserver
 import argparse
+from typing import TypedDict, DefaultDict, Any
+
+
+# Type definitions
+class ModelStats(TypedDict):
+    messages: int
+    tokens: int
+    cost: float
+    llm_time: float
+    output_tokens: int
+
+
+class ToolStats(TypedDict):
+    calls: int
+    time: float
+    errors: int
+
+
+class DailyStats(TypedDict):
+    messages: int
+    tokens: int
+    cost: float
+
+
+class SessionStats(TypedDict):
+    messages: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    total_tokens: int
+    cost_total: float
+    models: DefaultDict[str, ModelStats]
+    timestamps: list[datetime]
+    start: datetime | None
+    end: datetime | None
+    llm_time: float
+    tool_time: float
+    tools: DefaultDict[str, ToolStats]
+    tps_samples: list[tuple[int, float, str]]
+    cwd: str
+
+
+class ProjectStats(TypedDict):
+    name: str
+    sessions: list[dict[str, Any]]
+    total_messages: int
+    total_tokens: int
+    total_output_tokens: int
+    total_cost: float
+    total_llm_time: float
+    total_tool_time: float
+    models: DefaultDict[str, ModelStats]
+    tools: DefaultDict[str, ToolStats]
+    daily_stats: DefaultDict[str, DailyStats]
+    first_activity: datetime | None
+    last_activity: datetime | None
+    tps_samples: list[tuple[int, float, str]]
+
+
+class GlobalStats(TypedDict):
+    total_cost: float
+    total_tokens: int
+    total_output_tokens: int
+    total_messages: int
+    total_sessions: int
+    total_projects: int
+    total_llm_time: float
+    total_tool_time: float
+    models: DefaultDict[str, ModelStats]
+    tools: DefaultDict[str, ToolStats]
+    daily_stats: DefaultDict[str, DailyStats]
+    tps_samples: list[tuple[int, float, str]]
+
+
+# Helper functions to create properly-typed defaultdicts
+def create_model_stats() -> ModelStats:
+    return {
+        "messages": 0,
+        "tokens": 0,
+        "cost": 0.0,
+        "llm_time": 0.0,
+        "output_tokens": 0,
+    }
+
+
+def create_tool_stats() -> ToolStats:
+    return {"calls": 0, "time": 0.0, "errors": 0}
+
+
+def create_daily_stats() -> DailyStats:
+    return {"messages": 0, "tokens": 0, "cost": 0.0}
+
 
 SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
@@ -65,7 +157,7 @@ def parse_timestamp(ts):
         return None
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except:
+    except (ValueError, TypeError):
         return None
 
 
@@ -111,14 +203,14 @@ def get_project_path_from_jsonl(project_dir):
                     data = json.loads(first_line)
                     if data.get("type") == "session" and "cwd" in data:
                         return data["cwd"]
-        except:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
             continue
     return project_dir.name
 
 
-def analyze_jsonl_file(filepath):
+def analyze_jsonl_file(filepath: Path) -> SessionStats:
     """Analyze a single JSONL file and return stats."""
-    stats = {
+    stats: SessionStats = {
         "messages": 0,
         "input_tokens": 0,
         "output_tokens": 0,
@@ -126,24 +218,15 @@ def analyze_jsonl_file(filepath):
         "cache_write_tokens": 0,
         "total_tokens": 0,
         "cost_total": 0.0,
-        "models": defaultdict(
-            lambda: {
-                "messages": 0,
-                "tokens": 0,
-                "cost": 0.0,
-                "llm_time": 0.0,
-                "output_tokens": 0,
-            }
-        ),
+        "models": defaultdict(create_model_stats),
         "timestamps": [],
         "start": None,
         "end": None,
         "llm_time": 0.0,  # Total LLM working time in seconds
         "tool_time": 0.0,  # Total tool execution time in seconds
-        "tools": defaultdict(
-            lambda: {"calls": 0, "time": 0.0, "errors": 0}
-        ),  # Per-tool stats
+        "tools": defaultdict(create_tool_stats),  # Per-tool stats
         "tps_samples": [],  # List of (output_tokens, llm_seconds) per call for tokens/sec calculation
+        "cwd": "",
     }
 
     last_request_ts = None  # Timestamp of last user message or toolResult
@@ -159,7 +242,7 @@ def analyze_jsonl_file(filepath):
                     session_data = json.loads(first_line)
                     if session_data.get("type") == "session":
                         cwd = session_data.get("cwd", "")
-                except:
+                except (json.JSONDecodeError, TypeError):
                     pass
 
             # Now process the rest of the file
@@ -282,9 +365,9 @@ def analyze_jsonl_file(filepath):
     return stats
 
 
-def analyze_project(project_dir):
+def analyze_project(project_dir: Path) -> ProjectStats | None:
     """Analyze all sessions in a project directory."""
-    project_stats = {
+    project_stats: ProjectStats = {
         "name": get_project_path_from_jsonl(project_dir),
         "sessions": [],
         "total_messages": 0,
@@ -293,17 +376,9 @@ def analyze_project(project_dir):
         "total_cost": 0.0,
         "total_llm_time": 0.0,
         "total_tool_time": 0.0,
-        "models": defaultdict(
-            lambda: {
-                "messages": 0,
-                "tokens": 0,
-                "cost": 0.0,
-                "llm_time": 0.0,
-                "output_tokens": 0,
-            }
-        ),
-        "tools": defaultdict(lambda: {"calls": 0, "time": 0.0, "errors": 0}),
-        "daily_stats": defaultdict(lambda: {"messages": 0, "tokens": 0, "cost": 0.0}),
+        "models": defaultdict(create_model_stats),
+        "tools": defaultdict(create_tool_stats),
+        "daily_stats": defaultdict(create_daily_stats),
         "first_activity": None,
         "last_activity": None,
         "tps_samples": [],  # Aggregated tokens/sec samples
@@ -500,14 +575,14 @@ def get_session_cwd(session_path: str) -> str:
                 data = json.loads(first_line)
                 if data.get("type") == "session" and "cwd" in data:
                     return data["cwd"]
-    except:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
         pass
     return ""
 
 
-def get_all_sessions():
+def get_all_sessions() -> list[dict[str, Any]]:
     """Get a flat list of all sessions with their project info."""
-    sessions = []
+    sessions: list[dict[str, Any]] = []
     if not SESSIONS_DIR.exists():
         return sessions
 
@@ -568,10 +643,10 @@ def get_all_sessions():
     return sessions
 
 
-def collect_all_stats():
+def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
     """Collect statistics from all projects."""
-    all_projects = []
-    global_stats = {
+    all_projects: list[ProjectStats] = []
+    global_stats: GlobalStats = {
         "total_cost": 0.0,
         "total_tokens": 0,
         "total_output_tokens": 0,
@@ -580,17 +655,9 @@ def collect_all_stats():
         "total_projects": 0,
         "total_llm_time": 0.0,
         "total_tool_time": 0.0,
-        "models": defaultdict(
-            lambda: {
-                "messages": 0,
-                "tokens": 0,
-                "cost": 0.0,
-                "llm_time": 0.0,
-                "output_tokens": 0,
-            }
-        ),
-        "tools": defaultdict(lambda: {"calls": 0, "time": 0.0, "errors": 0}),
-        "daily_stats": defaultdict(lambda: {"messages": 0, "cost": 0.0}),
+        "models": defaultdict(create_model_stats),
+        "tools": defaultdict(create_tool_stats),
+        "daily_stats": defaultdict(create_daily_stats),
         "tps_samples": [],
     }
 
@@ -1838,10 +1905,10 @@ def main():
             socketserver.TCPServer.server_bind(self)
 
     httpd = DashboardServer(("", args.port), DashboardHandler)
-    print(f"🚀 Pi Agent Cost Dashboard")
+    print("🚀 Pi Agent Cost Dashboard")
     print(f"   Serving on: http://localhost:{args.port}")
     print(f"   Data from:  {SESSIONS_DIR}")
-    print(f"\n   Press Ctrl+C to stop\n")
+    print("\n   Press Ctrl+C to stop\n")
 
     # Set a timeout on the socket so we can check for shutdown periodically
     httpd.timeout = 0.5
