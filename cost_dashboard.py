@@ -1456,7 +1456,7 @@ def generate_html():
             <table id="sessions-table">
                 <thead>
                     <tr>
-                        <th>Project / Session</th>
+                        <th data-sort="project">Project / Session <span class="sort-icon">▼</span></th>
                         <th data-sort="start">Date <span class="sort-icon">▼</span></th>
                         <th data-sort="duration">Duration <span class="sort-icon">▼</span></th>
                         <th data-sort="llm_time">LLM Time <span class="sort-icon">▼</span></th>
@@ -1617,11 +1617,49 @@ def generate_html():
                 });
             });
 
-            // Sort by aggregated cost
+            // Helper to get aggregated value for a session (including subagents)
+            function getAggregatedValue(s, field) {
+                const subs = s.subagent_sessions || [];
+                const all = [s, ...subs];
+                
+                switch(field) {
+                    case 'cost':
+                        return all.reduce((sum, session) => sum + session.cost, 0);
+                    case 'tokens':
+                        return all.reduce((sum, session) => sum + session.tokens, 0);
+                    case 'messages':
+                        return all.reduce((sum, session) => sum + session.messages, 0);
+                    case 'llm_time':
+                        return all.reduce((sum, session) => sum + (session.llm_time || 0), 0);
+                    case 'tool_time':
+                        return all.reduce((sum, session) => sum + (session.tool_time || 0), 0);
+                    case 'avg_tps':
+                        const tpsValues = all.map(session => session.avg_tps || 0).filter(v => v > 0);
+                        return tpsValues.length > 0 ? tpsValues.reduce((a, b) => a + b, 0) / tpsValues.length : 0;
+                    case 'duration':
+                        const starts = all.map(session => session.start).filter(Boolean);
+                        const ends = all.map(session => session.end).filter(Boolean);
+                        if (!starts.length || !ends.length) return 0;
+                        const earliest = Math.min(...starts.map(d => new Date(d)));
+                        const latest = Math.max(...ends.map(d => new Date(d)));
+                        return (latest - earliest) / 1000;
+                    case 'start':
+                        return s.start ? new Date(s.start).getTime() : 0;
+                    case 'project':
+                        return s.cwd.toLowerCase();
+                    default:
+                        return s[field] || 0;
+                }
+            }
+            
+            // Sort sessions using current sort state
             const sortedSessions = [...allSessionsWithSubs].sort((a, b) => {
-                const aCost = a.cost + (a.subagent_sessions || []).reduce((sum, s) => sum + s.cost, 0);
-                const bCost = b.cost + (b.subagent_sessions || []).reduce((sum, s) => sum + s.cost, 0);
-                return bCost - aCost;
+                const aVal = getAggregatedValue(a, sessionsSort.field);
+                const bVal = getAggregatedValue(b, sessionsSort.field);
+                
+                if (aVal < bVal) return sessionsSort.asc ? -1 : 1;
+                if (aVal > bVal) return sessionsSort.asc ? 1 : -1;
+                return 0;
             });
 
             const totalSessions = allSessionsWithSubs.reduce((sum, s) => sum + 1 + (s.subagent_sessions || []).length, 0);
@@ -1888,7 +1926,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="Pi Agent Cost Dashboard Server")
     parser.add_argument(
-        "-p", "--port", type=int, default=8080, help="Port to serve on (default: 8080)"
+        "-p", "--port", type=int, default=8753, help="Port to serve on (default: 8753)"
     )
     args = parser.parse_args()
 
