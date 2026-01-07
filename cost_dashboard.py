@@ -106,7 +106,11 @@ def create_daily_stats() -> DailyStats:
     return {"messages": 0, "tokens": 0, "cost": 0.0}
 
 
-SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
+# Session directories for different agents: (path, agent_command)
+SESSIONS_DIRS = [
+    (Path.home() / ".pi" / "agent" / "sessions", "pi"),
+    (Path.home() / ".omp" / "agent" / "sessions", "omp"),
+]
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
 
 # Manual pricing for models that report zero cost (price per million tokens)
@@ -365,10 +369,11 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
     return stats
 
 
-def analyze_project(project_dir: Path) -> ProjectStats | None:
+def analyze_project(project_dir: Path, agent_cmd: str = "pi") -> ProjectStats | None:
     """Analyze all sessions in a project directory."""
     project_stats: ProjectStats = {
         "name": get_project_path_from_jsonl(project_dir),
+        "agent_cmd": agent_cmd,
         "sessions": [],
         "total_messages": 0,
         "total_tokens": 0,
@@ -580,69 +585,6 @@ def get_session_cwd(session_path: str) -> str:
     return ""
 
 
-def get_all_sessions() -> list[dict[str, Any]]:
-    """Get a flat list of all sessions with their project info."""
-    sessions: list[dict[str, Any]] = []
-    if not SESSIONS_DIR.exists():
-        return sessions
-
-    for project_dir in SESSIONS_DIR.iterdir():
-        if not project_dir.is_dir() or project_dir.name.startswith("."):
-            continue
-
-        project_name = get_project_path_from_jsonl(project_dir)
-
-        # Only get top-level JSONL files
-        for filepath in project_dir.glob("*.jsonl"):
-            stats = analyze_jsonl_file(filepath)
-            if stats["messages"] > 0:
-                # Look for subagent sessions in matching subdirectory
-                session_name = filepath.stem
-                subagent_dir = filepath.parent / session_name
-
-                if subagent_dir.exists() and subagent_dir.is_dir():
-                    # Add subagent sessions
-                    for sub_jsonl in subagent_dir.rglob("*.jsonl"):
-                        sub_stats = analyze_jsonl_file(sub_jsonl)
-                        if sub_stats["messages"] > 0:
-                            try:
-                                sub_relative = sub_jsonl.relative_to(project_dir)
-                            except ValueError:
-                                sub_relative = sub_jsonl.name
-
-                            sessions.append(
-                                {
-                                    "project": project_name,
-                                    "file": sub_jsonl.name,
-                                    "path": str(sub_jsonl),
-                                    "relative_path": str(sub_relative),
-                                    "cwd": get_session_cwd(str(sub_jsonl)),
-                                    "messages": sub_stats["messages"],
-                                    "tokens": sub_stats["total_tokens"],
-                                    "cost": sub_stats["cost_total"],
-                                    "start": sub_stats["start"],
-                                    "end": sub_stats["end"],
-                                }
-                            )
-
-                sessions.append(
-                    {
-                        "project": project_name,
-                        "file": filepath.name,
-                        "path": str(filepath),
-                        "relative_path": filepath.name,
-                        "cwd": get_session_cwd(str(filepath)),
-                        "messages": stats["messages"],
-                        "tokens": stats["total_tokens"],
-                        "cost": stats["cost_total"],
-                        "start": stats["start"],
-                        "end": stats["end"],
-                    }
-                )
-
-    return sessions
-
-
 def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
     """Collect statistics from all projects."""
     all_projects: list[ProjectStats] = []
@@ -661,43 +603,44 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
         "tps_samples": [],
     }
 
-    if not SESSIONS_DIR.exists():
-        return all_projects, global_stats
-
-    for project_dir in SESSIONS_DIR.iterdir():
-        if not project_dir.is_dir() or project_dir.name.startswith("."):
+    for sessions_dir, agent_cmd in SESSIONS_DIRS:
+        if not sessions_dir.exists():
             continue
 
-        project_stats = analyze_project(project_dir)
-        if project_stats:
-            all_projects.append(project_stats)
-            global_stats["total_cost"] += project_stats["total_cost"]
-            global_stats["total_tokens"] += project_stats["total_tokens"]
-            global_stats["total_output_tokens"] += project_stats["total_output_tokens"]
-            global_stats["total_messages"] += project_stats["total_messages"]
-            global_stats["total_sessions"] += len(project_stats["sessions"])
-            global_stats["total_projects"] += 1
-            global_stats["total_llm_time"] += project_stats["total_llm_time"]
-            global_stats["total_tool_time"] += project_stats["total_tool_time"]
-            global_stats["tps_samples"].extend(project_stats["tps_samples"])
+        for project_dir in sessions_dir.iterdir():
+            if not project_dir.is_dir() or project_dir.name.startswith("."):
+                continue
 
-            for model, mstats in project_stats["models"].items():
-                global_stats["models"][model]["messages"] += mstats["messages"]
-                global_stats["models"][model]["tokens"] += mstats["tokens"]
-                global_stats["models"][model]["cost"] += mstats["cost"]
-                global_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
-                global_stats["models"][model]["output_tokens"] += mstats.get(
-                    "output_tokens", 0
-                )
+            project_stats = analyze_project(project_dir, agent_cmd)
+            if project_stats:
+                all_projects.append(project_stats)
+                global_stats["total_cost"] += project_stats["total_cost"]
+                global_stats["total_tokens"] += project_stats["total_tokens"]
+                global_stats["total_output_tokens"] += project_stats["total_output_tokens"]
+                global_stats["total_messages"] += project_stats["total_messages"]
+                global_stats["total_sessions"] += len(project_stats["sessions"])
+                global_stats["total_projects"] += 1
+                global_stats["total_llm_time"] += project_stats["total_llm_time"]
+                global_stats["total_tool_time"] += project_stats["total_tool_time"]
+                global_stats["tps_samples"].extend(project_stats["tps_samples"])
 
-            for tool_name, tstats in project_stats["tools"].items():
-                global_stats["tools"][tool_name]["calls"] += tstats["calls"]
-                global_stats["tools"][tool_name]["time"] += tstats["time"]
-                global_stats["tools"][tool_name]["errors"] += tstats["errors"]
+                for model, mstats in project_stats["models"].items():
+                    global_stats["models"][model]["messages"] += mstats["messages"]
+                    global_stats["models"][model]["tokens"] += mstats["tokens"]
+                    global_stats["models"][model]["cost"] += mstats["cost"]
+                    global_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
+                    global_stats["models"][model]["output_tokens"] += mstats.get(
+                        "output_tokens", 0
+                    )
 
-            for day, dstats in project_stats["daily_stats"].items():
-                global_stats["daily_stats"][day]["messages"] += dstats["messages"]
-                global_stats["daily_stats"][day]["cost"] += dstats["cost"]
+                for tool_name, tstats in project_stats["tools"].items():
+                    global_stats["tools"][tool_name]["calls"] += tstats["calls"]
+                    global_stats["tools"][tool_name]["time"] += tstats["time"]
+                    global_stats["tools"][tool_name]["errors"] += tstats["errors"]
+
+                for day, dstats in project_stats["daily_stats"].items():
+                    global_stats["daily_stats"][day]["messages"] += dstats["messages"]
+                    global_stats["daily_stats"][day]["cost"] += dstats["cost"]
 
     return all_projects, global_stats
 
@@ -745,6 +688,7 @@ def generate_html():
                         "tool_time": sub_tool,
                         "tool_time_display": format_duration(sub_tool),
                         "avg_tps": sub_tps,
+                        "agent_cmd": p["agent_cmd"],
                     }
                 )
 
@@ -772,6 +716,7 @@ def generate_html():
                     "tool_time_display": format_duration(tool_secs),
                     "avg_tps": session_tps,
                     "subagent_sessions": sub_sessions_json,
+                    "agent_cmd": p["agent_cmd"],
                 }
             )
         # Build model breakdown for this project
@@ -1474,7 +1419,7 @@ def generate_html():
         </div>
         
         <footer>
-            Pi Agent Cost Dashboard • Data from ~/.pi/agent/sessions
+            Agent Cost Dashboard • Data from ~/.pi and ~/.omp
         </footer>
     </div>
     
@@ -1676,7 +1621,7 @@ def generate_html():
                 if (!hasSubs) {
                     const sessionUrl = '/session?path=' + encodeURIComponent(s.path);
                     const resumePath = s.path.replace(/\\\\/g, '/');
-                    const resumeCmd = 'cd "' + s.cwd + '" && pi --session "' + resumePath + '"';
+                    const resumeCmd = 'cd "' + s.cwd + '" && ' + s.agent_cmd + ' --session "' + resumePath + '"';
                     const encodedCmd = encodeURIComponent(resumeCmd);
                     const shortProject = s.cwd.length > 40 ? '...' + s.cwd.slice(-37) : s.cwd;
 
@@ -1727,7 +1672,7 @@ def generate_html():
                 // Summary row with resume/open buttons
                 const sessionUrl = '/session?path=' + encodeURIComponent(s.path);
                 const resumePath = s.path.replace(/\\\\/g, '/');
-                const resumeCmd = 'cd "' + s.cwd + '" && pi --session "' + resumePath + '"';
+                const resumeCmd = 'cd "' + s.cwd + '" && ' + s.agent_cmd + ' --session "' + resumePath + '"';
                 const encodedCmd = encodeURIComponent(resumeCmd);
 
                 // Calculate average tokens/sec for aggregated sessions
@@ -1783,7 +1728,7 @@ def generate_html():
                 subs.forEach(sub => {
                     const subSessionUrl = '/session?path=' + encodeURIComponent(sub.path);
                     const subResumePath = sub.path.replace(/\\\\/g, '/');
-                    const subResumeCmd = 'cd "' + sub.cwd + '" && pi --session "' + subResumePath + '"';
+                    const subResumeCmd = 'cd "' + sub.cwd + '" && ' + sub.agent_cmd + ' --session "' + subResumePath + '"';
                     const subEncodedCmd = encodeURIComponent(subResumeCmd);
 
                     // Just show the filename, not the full relative path
@@ -1924,7 +1869,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pi Agent Cost Dashboard Server")
+    parser = argparse.ArgumentParser(description="Agent Cost Dashboard Server")
     parser.add_argument(
         "-H", "--host", type=str, default="localhost", help="Host to bind to (default: localhost)"
     )
@@ -1933,10 +1878,10 @@ def main():
     )
     args = parser.parse_args()
 
-    # Check if sessions directory exists
-    if not SESSIONS_DIR.exists():
-        print(f"⚠️  Sessions directory not found: {SESSIONS_DIR}")
-        print("   No data to display yet.")
+    # Check if any sessions directory exists
+    any_exists = any(sessions_dir.exists() for sessions_dir, _ in SESSIONS_DIRS)
+    if not any_exists:
+        print("⚠️  No sessions directories found. No data to display yet.")
 
     # Start server
     class DashboardServer(socketserver.TCPServer):
@@ -1946,9 +1891,12 @@ def main():
             socketserver.TCPServer.server_bind(self)
 
     httpd = DashboardServer((args.host, args.port), DashboardHandler)
-    print("🚀 Pi Agent Cost Dashboard")
+    print("🚀 Agent Cost Dashboard")
     print(f"   Serving on: http://{args.host}:{args.port}")
-    print(f"   Data from:  {SESSIONS_DIR}")
+    print(f"   Data from:")
+    for sessions_dir, agent_cmd in SESSIONS_DIRS:
+        exists = "✓" if sessions_dir.exists() else "✗"
+        print(f"     {exists} {sessions_dir} ({agent_cmd})")
     print("\n   Press Ctrl+C to stop\n")
 
     # Set a timeout on the socket so we can check for shutdown periodically

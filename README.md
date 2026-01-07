@@ -1,6 +1,6 @@
-# Pi Agent Cost Dashboard
+# Agent Cost Dashboard
 
-Interactive web dashboard to monitor and analyze your [Pi](https://github.com/mariozechner/pi-coding-agent) coding agent API costs.
+Interactive web dashboard to monitor and analyze your [Pi](https://github.com/mariozechner/pi-coding-agent) and [Oh My Pi](https://github.com/can1357/oh-my-pi) coding agent API costs.
 
 ![Main dashboard showing global stats, and daily spending](screenshots/dashboard-overview.png)
 
@@ -61,7 +61,7 @@ Browse every session with full details:
 ### Requirements
 
 - **Python 3.12+**
-- **Pi** - The coding agent ([install guide](https://github.com/mariozechner/pi-coding-agent))
+- **Pi** ([install guide](https://github.com/mariozechner/pi-coding-agent)) and/or **Oh My Pi** ([install guide](https://github.com/can1357/oh-my-pi))
 
 ### Setup
 
@@ -89,7 +89,7 @@ cd pi-cost-dashboard
 
 Then open http://localhost:8753 in your browser.
 
-The dashboard automatically reads session data from `~/.pi/agent/sessions`.
+The dashboard automatically reads session data from `~/.pi/agent/sessions` and `~/.omp/agent/sessions`.
 
 ## Pricing
 
@@ -98,3 +98,4 @@ The dashboard calculates costs using the pricing reported by the Pi agent. For m
 ## Credits
 
 - **[Mario Zechner](https://github.com/mariozechner)** - For Pi and its session export feature
+- **[can1357](https://github.com/can1357)** - For Oh My Pi
