@@ -1926,6 +1926,9 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="Pi Agent Cost Dashboard Server")
     parser.add_argument(
+        "-H", "--host", type=str, default="localhost", help="Host to bind to (default: localhost)"
+    )
+    parser.add_argument(
         "-p", "--port", type=int, default=8753, help="Port to serve on (default: 8753)"
     )
     args = parser.parse_args()
@@ -1942,9 +1945,9 @@ def main():
             self.allow_reuse_address = True
             socketserver.TCPServer.server_bind(self)
 
-    httpd = DashboardServer(("", args.port), DashboardHandler)
+    httpd = DashboardServer((args.host, args.port), DashboardHandler)
     print("🚀 Pi Agent Cost Dashboard")
-    print(f"   Serving on: http://localhost:{args.port}")
+    print(f"   Serving on: http://{args.host}:{args.port}")
     print(f"   Data from:  {SESSIONS_DIR}")
     print("\n   Press Ctrl+C to stop\n")
 

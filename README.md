@@ -74,11 +74,17 @@ cd pi-cost-dashboard
 ## Usage
 
 ```bash
-# Start the dashboard (defaults to port 8753)
+# Start the dashboard (defaults to localhost:8753)
 ./cost_dashboard.py
 
 # Use a custom port
 ./cost_dashboard.py --port 3000
+
+# Bind to all interfaces (accessible from network)
+./cost_dashboard.py --host 0.0.0.0
+
+# Custom host and port
+./cost_dashboard.py -H 0.0.0.0 -p 3000
 ```
 
 Then open http://localhost:8753 in your browser.
