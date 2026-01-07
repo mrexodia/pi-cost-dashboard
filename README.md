@@ -1,69 +1,94 @@
-# Pi Agent Cost Tracker
+# Pi Agent Cost Dashboard
 
-Monitor and analyze your [Pi](https://shittycodingagent.ai) coding agent API costs with detailed statistics and interactive dashboards.
+Interactive web dashboard to monitor and analyze your [Pi](https://github.com/mariozechner/pi-coding-agent) coding agent API costs.
+
+![Main dashboard showing global stats, and daily spending](screenshots/dashboard-overview.png)
 
 ## Features
 
-### 📊 Cost Dashboard (`cost_dashboard.py`)
+### 📊 Global Statistics
+Track your total spending across all projects and sessions:
+- **Total cost** with breakdown by input, output, and cache tokens
+- **Token usage** across all models
+- **Session count** and project count
+- **LLM time** vs tool execution time
+- **Average tokens per second** across all API calls
 
-**Interactive web dashboard** showing all your Pi sessions with real-time cost analysis:
+### 📈 Daily Spending Chart
+Visual timeline of your API costs over time, helping you spot trends and usage patterns.
 
-```bash
-./cost_dashboard.py
-# Opens at http://localhost:8080
-```
+### 🤖 Model Breakdown
+See costs broken down by AI model (Claude Opus, Sonnet, Gemini, etc.):
+- Messages per model
+- Token usage per model
+- Cost per model
+- Average tokens per second
 
-**Dashboard displays:**
-- **Global stats** - Total spending, projects, sessions, API calls, tokens used
-- **Daily spending** - Visual chart of costs over time
-- **Model breakdown** - Cost per AI model (Claude Opus, Sonnet, etc.)
-- **Project view** - All projects with expandable model details
-- **Session browser** - Every session with resume commands and full transcripts
-- **Sortable tables** - Click headers to sort by cost, tokens, time, date
+![Model Stats](screenshots/model-stats.png)
 
-**Key metrics tracked:**
-- **Total cost** - Broken down by input, output, cache operations
-- **Token usage** - Input, output, cache read/write tokens
-- **LLM time** - Actual time the AI was working (vs. waiting)
-- **Session duration** - Wall-clock time per session
-- **Cache efficiency** - See how much you're saving with prompt caching
+### 🔧 Tool Usage
+Track which tools your agent uses most:
+- Call counts per tool
+- Execution time per tool
+- Error rates
+
+![Tool Stats](screenshots/tool-stats.png)
+
+### 📁 Project View
+All your projects with expandable details:
+- Per-project cost breakdown
+- Model usage per project
+- Tool usage per project
+- Session history per project
+- Average tokens per second
+- Sortable by cost, tokens, LLM time, or date
+
+![Projects](screenshots/projects.png)
+
+### 📜 Session Browser
+Browse every session with full details:
+- Copy command to resume session to the clipboard
+- Full transcript export (opens in browser via `pi --export`)
+- Session duration, LLM time, and tool time
+- Average tokens per second
+- Subagent session support with expandable grouping
+- Sortable by date, duration, cost, tokens, and more
+
+![Sessions](screenshots/sessions.png)
 
 ## Installation
 
 ### Requirements
 
-- **Python 3.12+** (for dashboard and stats tools)
+- **Python 3.12+**
 - **Pi** - The coding agent ([install guide](https://github.com/mariozechner/pi-coding-agent))
 
 ### Setup
 
 ```bash
-# Clone or download this repository
-git clone <your-repo-url>
-cd pi-cost-tracker
+# Clone this repository
+git clone https://github.com/user/pi-cost-dashboard
+cd pi-cost-dashboard
 ```
 
-## Quick Start
-
-### Analyze Current Directory
+## Usage
 
 ```bash
-# View stats for all .jsonl files in current directory
-./cost_stats.py
-```
-
-### Launch Dashboard
-
-```bash
-# Start web dashboard (analyzes all sessions in ~/.pi/agent/sessions)
+# Start the dashboard (defaults to port 8753)
 ./cost_dashboard.py
 
-# Open http://localhost:8080 in your browser
-
-# Use custom port
+# Use a custom port
 ./cost_dashboard.py --port 3000
 ```
 
+Then open http://localhost:8753 in your browser.
+
+The dashboard automatically reads session data from `~/.pi/agent/sessions`.
+
+## Pricing
+
+The dashboard calculates costs using the pricing reported by the Pi agent. For models that don't report costs (like Gemini via Google Cloud), estimated pricing is applied based on public API rates.
+
 ## Credits
 
-- **[Mario Zechner](https://github.com/mariozechner)** - For Pi and its export feature
+- **[Mario Zechner](https://github.com/mariozechner)** - For Pi and its session export feature
