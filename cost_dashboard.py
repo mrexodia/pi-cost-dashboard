@@ -1377,7 +1377,7 @@ def generate_html():
             <table id="projects-table">
                 <thead>
                     <tr>
-                        <th data-sort="name" class="sorted">Project <span class="sort-icon">▲</span></th>
+                        <th data-sort="name">Project <span class="sort-icon">▼</span></th>
                         <th data-sort="sessions">Sessions <span class="sort-icon">▼</span></th>
                         <th data-sort="messages">Messages <span class="sort-icon">▼</span></th>
                         <th data-sort="tokens">Tokens <span class="sort-icon">▼</span></th>
@@ -1385,7 +1385,7 @@ def generate_html():
                         <th data-sort="tool_time">Tool Time <span class="sort-icon">▼</span></th>
                         <th data-sort="avg_tps">Tok/s <span class="sort-icon">▼</span></th>
                         <th data-sort="cost">Cost <span class="sort-icon">▼</span></th>
-                        <th data-sort="last_activity">Last Activity <span class="sort-icon">▼</span></th>
+                        <th data-sort="last_activity" class="sorted">Last Activity <span class="sort-icon">▼</span></th>
                     </tr>
                 </thead>
                 <tbody id="projects-tbody">
@@ -1462,7 +1462,7 @@ def generate_html():
             sessionsByProject[s.project].push(s);
         });
 
-        let projectSort = { field: 'cost', asc: false };
+        let projectSort = { field: 'last_activity', asc: false };
         let sessionSort = { field: 'end', asc: false };  // Sort by last activity (most recent first)
         let sessionsSort = { field: 'end', asc: false };
         
