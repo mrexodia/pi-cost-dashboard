@@ -5,6 +5,7 @@ import json
 import subprocess
 import tempfile
 import urllib.parse
+import uuid
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -12,7 +13,7 @@ import html
 import http.server
 import socketserver
 import argparse
-from typing import TypedDict, DefaultDict, Any
+from typing import TypedDict, DefaultDict
 
 
 # Type definitions
@@ -58,7 +59,7 @@ class SessionStats(TypedDict):
 class ProjectStats(TypedDict):
     name: str
     agent_cmd: str
-    sessions: list[dict[str, Any]]
+    sessions: list["Session"]
     total_messages: int
     total_tokens: int
     total_output_tokens: int
@@ -88,6 +89,29 @@ class GlobalStats(TypedDict):
     tps_samples: list[tuple[int, float, str]]
 
 
+class Session(TypedDict):
+    """Session data for a single agent session."""
+
+    file: str
+    path: str
+    uid: str
+    relative_path: str
+    cwd: str
+    agent_cmd: str
+    messages: int
+    tokens: int
+    output_tokens: int
+    cost: float
+    start: datetime | None
+    end: datetime | None
+    duration: float
+    llm_time: float
+    tool_time: float
+    tools: dict[str, ToolStats]
+    avg_tps: float
+    subagent_sessions: list["Session"]
+
+
 # Helper functions to create properly-typed defaultdicts
 def create_model_stats() -> ModelStats:
     return {
@@ -113,6 +137,36 @@ SESSIONS_DIRS = [
     (Path.home() / ".omp" / "agent" / "sessions", "omp"),
 ]
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
+
+# Registry mapping session UUIDs to session data
+# This keeps sensitive path/command info server-side only
+SESSION_REGISTRY: dict[str, Session] = {}
+
+
+def clear_session_registry() -> None:
+    """Clear all sessions from the registry."""
+    SESSION_REGISTRY.clear()
+
+
+def get_session_id_from_file(filepath: str) -> str | None:
+    """Extract session ID from the first line of a JSONL file.
+
+    The first line should be a session record like:
+    {"type":"session","id":"5d741a94-5587-4176-b557-1614ca95ac8c",...}
+
+    Returns the session ID if found, None otherwise.
+    """
+    try:
+        with open(filepath, "r") as f:
+            first_line = f.readline().strip()
+            if first_line:
+                data = json.loads(first_line)
+                if data.get("type") == "session" and "id" in data:
+                    return data["id"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return None
+
 
 # Manual pricing for models that report zero cost (price per million tokens)
 # Format: model_pattern -> {"input": price_per_M, "output": price_per_M, "cache_read": price_per_M}
@@ -427,27 +481,33 @@ def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
                     except ValueError:
                         sub_relative = sub_jsonl
 
-                    subagent_sessions.append(
-                        {
-                            "file": sub_jsonl.name,
-                            "path": str(sub_jsonl),
-                            "relative_path": str(sub_relative),
-                            "cwd": sub_stats["cwd"],
-                            "messages": sub_stats["messages"],
-                            "tokens": sub_stats["total_tokens"],
-                            "output_tokens": sub_stats["output_tokens"],
-                            "cost": sub_stats["cost_total"],
-                            "start": sub_stats["start"],
-                            "end": sub_stats["end"],
-                            "duration": sub_duration,
-                            "llm_time": sub_stats["llm_time"],
-                            "tool_time": sub_stats["tool_time"],
-                            "tools": dict(sub_stats["tools"]),
-                            "avg_tps": calc_avg_tokens_per_sec(
-                                sub_stats["tps_samples"]
-                            ),
-                        }
+                    # Get UID from file or generate random one
+                    sub_uid = get_session_id_from_file(str(sub_jsonl)) or str(
+                        uuid.uuid4()
                     )
+
+                    sub_session = Session(
+                        file=sub_jsonl.name,
+                        path=str(sub_jsonl),
+                        uid=sub_uid,
+                        relative_path=str(sub_relative),
+                        cwd=sub_stats["cwd"],
+                        agent_cmd=agent_cmd,
+                        messages=sub_stats["messages"],
+                        tokens=sub_stats["total_tokens"],
+                        output_tokens=sub_stats["output_tokens"],
+                        cost=sub_stats["cost_total"],
+                        start=sub_stats["start"],
+                        end=sub_stats["end"],
+                        duration=sub_duration,
+                        llm_time=sub_stats["llm_time"],
+                        tool_time=sub_stats["tool_time"],
+                        tools=dict(sub_stats["tools"]),
+                        avg_tps=calc_avg_tokens_per_sec(sub_stats["tps_samples"]),
+                        subagent_sessions=[],
+                    )
+                    SESSION_REGISTRY[sub_uid] = sub_session
+                    subagent_sessions.append(sub_session)
 
                     # Include subagent stats in project totals
                     project_stats["total_messages"] += sub_stats["messages"]
@@ -484,24 +544,30 @@ def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
                             "cost_total"
                         ] / max(len(sub_stats["timestamps"]), 1)
 
-        session = {
-            "file": filepath.name,
-            "path": str(filepath),
-            "relative_path": filepath.name,  # Top-level, just the filename
-            "cwd": stats["cwd"],
-            "messages": stats["messages"],
-            "tokens": stats["total_tokens"],
-            "output_tokens": stats["output_tokens"],
-            "cost": stats["cost_total"],
-            "start": stats["start"],
-            "end": stats["end"],
-            "duration": duration,
-            "llm_time": stats["llm_time"],
-            "tool_time": stats["tool_time"],
-            "tools": dict(stats["tools"]),
-            "avg_tps": calc_avg_tokens_per_sec(stats["tps_samples"]),
-            "subagent_sessions": subagent_sessions,  # List of nested sessions
-        }
+        # Get UID from file or generate random one
+        session_uid = get_session_id_from_file(str(filepath)) or str(uuid.uuid4())
+
+        session = Session(
+            file=filepath.name,
+            path=str(filepath),
+            uid=session_uid,
+            relative_path=filepath.name,  # Top-level, just the filename
+            cwd=stats["cwd"],
+            agent_cmd=agent_cmd,
+            messages=stats["messages"],
+            tokens=stats["total_tokens"],
+            output_tokens=stats["output_tokens"],
+            cost=stats["cost_total"],
+            start=stats["start"],
+            end=stats["end"],
+            duration=duration,
+            llm_time=stats["llm_time"],
+            tool_time=stats["tool_time"],
+            tools=dict(stats["tools"]),
+            avg_tps=calc_avg_tokens_per_sec(stats["tps_samples"]),
+            subagent_sessions=subagent_sessions,
+        )
+        SESSION_REGISTRY[session_uid] = session
         project_stats["sessions"].append(session)
 
         project_stats["total_messages"] += stats["messages"]
@@ -588,6 +654,9 @@ def get_session_cwd(session_path: str) -> str:
 
 def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
     """Collect statistics from all projects."""
+    # Clear the session registry to avoid stale entries on reload
+    clear_session_registry()
+
     all_projects: list[ProjectStats] = []
     global_stats: GlobalStats = {
         "total_cost": 0.0,
@@ -675,7 +744,10 @@ def generate_html():
                 sub_sessions_json.append(
                     {
                         "file": sub["file"],
-                        "path": sub["path"],
+                        "uid": sub["uid"],
+                        "path": sub[
+                            "path"
+                        ],  # Keep path for resume command (local use only)
                         "relative_path": sub["relative_path"],
                         "cwd": sub["cwd"],
                         "messages": sub["messages"],
@@ -693,7 +765,6 @@ def generate_html():
                         "tool_time": sub_tool,
                         "tool_time_display": format_duration(sub_tool),
                         "avg_tps": sub_tps,
-                        "agent_cmd": p["agent_cmd"],
                     }
                 )
 
@@ -702,7 +773,8 @@ def generate_html():
             sessions_json.append(
                 {
                     "file": s["file"],
-                    "path": s["path"],
+                    "uid": s["uid"],
+                    "path": s["path"],  # Keep path for resume command (local use only)
                     "relative_path": s.get("relative_path", s["file"]),
                     "cwd": s["cwd"],
                     "messages": s["messages"],
@@ -721,7 +793,6 @@ def generate_html():
                     "tool_time_display": format_duration(tool_secs),
                     "avg_tps": session_tps,
                     "subagent_sessions": sub_sessions_json,
-                    "agent_cmd": p["agent_cmd"],
                 }
             )
         # Build model breakdown for this project
@@ -771,6 +842,7 @@ def generate_html():
         projects_json.append(
             {
                 "name": p["name"],
+                "agent_cmd": p["agent_cmd"],  # Needed for resume command
                 "sessions": len(p["sessions"]),
                 "sessions_list": sessions_json,
                 "messages": p["total_messages"],
@@ -1563,7 +1635,8 @@ def generate_html():
             const allSessionsWithSubs = [];
             projects.forEach(p => {
                 p.sessions_list.forEach(s => {
-                    allSessionsWithSubs.push(s);
+                    // Add agent_cmd from parent project for resume command
+                    allSessionsWithSubs.push({...s, agent_cmd: p.agent_cmd});
                 });
             });
 
@@ -1624,7 +1697,7 @@ def generate_html():
 
                 // If no subagent sessions, just show the main session as a regular row
                 if (!hasSubs) {
-                    const sessionUrl = '/session?agent_cmd=' + encodeURIComponent(s.agent_cmd) + '&path=' + encodeURIComponent(s.path);
+                    const sessionUrl = '/session?uid=' + encodeURIComponent(s.uid);
                     const resumePath = s.path.replace(/\\\\/g, '/');
                     const resumeCmd = 'cd "' + s.cwd + '" && ' + s.agent_cmd + ' --session "' + resumePath + '"';
                     const encodedCmd = encodeURIComponent(resumeCmd);
@@ -1675,7 +1748,7 @@ def generate_html():
                 const dateDisplay = s.start_display;
 
                 // Summary row with resume/open buttons
-                const sessionUrl = '/session?agent_cmd=' + encodeURIComponent(s.agent_cmd) + '&path=' + encodeURIComponent(s.path);
+                const sessionUrl = '/session?uid=' + encodeURIComponent(s.uid);
                 const resumePath = s.path.replace(/\\\\/g, '/');
                 const resumeCmd = 'cd "' + s.cwd + '" && ' + s.agent_cmd + ' --session "' + resumePath + '"';
                 const encodedCmd = encodeURIComponent(resumeCmd);
@@ -1731,9 +1804,10 @@ def generate_html():
 
                 // Subagent sessions with buttons
                 subs.forEach(sub => {
-                    const subSessionUrl = '/session?agent_cmd=' + encodeURIComponent(sub.agent_cmd) + '&path=' + encodeURIComponent(sub.path);
+                    const subSessionUrl = '/session?uid=' + encodeURIComponent(sub.uid);
                     const subResumePath = sub.path.replace(/\\\\/g, '/');
-                    const subResumeCmd = 'cd "' + sub.cwd + '" && ' + sub.agent_cmd + ' --session "' + subResumePath + '"';
+                    // Use parent session's agent_cmd for subagent resume command
+                    const subResumeCmd = 'cd "' + sub.cwd + '" && ' + s.agent_cmd + ' --session "' + subResumePath + '"';
                     const subEncodedCmd = encodeURIComponent(subResumeCmd);
 
                     // Just show the filename, not the full relative path
@@ -1850,21 +1924,31 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(html_content.encode("utf-8"))
 
         elif parsed.path == "/session":
-            session_path = query.get("path", [None])[0]
-            agent_cmd = query.get("agent_cmd", ["pi"])[0]
-            # TODO: security, this allows for arbitrary command execution
-            if session_path and Path(session_path).exists():
-                self.send_response(200)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                html_content = export_session_to_html(session_path, agent_cmd)
-                self.wfile.write(html_content.encode("utf-8"))
+            uid = query.get("uid", [""])[0]
+            session_info = SESSION_REGISTRY.get(uid)
+
+            if session_info:
+                session_path = session_info["path"]
+                agent_cmd = session_info["agent_cmd"]
+                if Path(session_path).exists():
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    html_content = export_session_to_html(session_path, agent_cmd)
+                    self.wfile.write(html_content.encode("utf-8"))
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(
+                        b"<html><body><h1>Session file not found</h1></body></html>"
+                    )
             else:
                 self.send_response(404)
                 self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(
-                    b"<html><body><h1>Session not found</h1></body></html>"
+                    b"<html><body><h1>Invalid session ID</h1></body></html>"
                 )
 
         else:
