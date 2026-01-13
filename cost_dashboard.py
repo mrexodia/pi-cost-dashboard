@@ -57,6 +57,7 @@ class SessionStats(TypedDict):
 
 class ProjectStats(TypedDict):
     name: str
+    agent_cmd: str
     sessions: list[dict[str, Any]]
     total_messages: int
     total_tokens: int
@@ -369,7 +370,7 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
     return stats
 
 
-def analyze_project(project_dir: Path, agent_cmd: str = "pi") -> ProjectStats | None:
+def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
     """Analyze all sessions in a project directory."""
     project_stats: ProjectStats = {
         "name": get_project_path_from_jsonl(project_dir),
@@ -548,7 +549,7 @@ def analyze_project(project_dir: Path, agent_cmd: str = "pi") -> ProjectStats | 
     return project_stats if project_stats["sessions"] else None
 
 
-def export_session_to_html(session_path: str) -> str:
+def export_session_to_html(session_path: str, agent_cmd: str) -> str:
     """Export a session file to HTML using pi --export."""
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -558,7 +559,7 @@ def export_session_to_html(session_path: str) -> str:
 
     try:
         result = subprocess.run(
-            ["pi", "--export", session_path, str(output_file)],
+            [agent_cmd, "--export", session_path, str(output_file)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -616,7 +617,9 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
                 all_projects.append(project_stats)
                 global_stats["total_cost"] += project_stats["total_cost"]
                 global_stats["total_tokens"] += project_stats["total_tokens"]
-                global_stats["total_output_tokens"] += project_stats["total_output_tokens"]
+                global_stats["total_output_tokens"] += project_stats[
+                    "total_output_tokens"
+                ]
                 global_stats["total_messages"] += project_stats["total_messages"]
                 global_stats["total_sessions"] += len(project_stats["sessions"])
                 global_stats["total_projects"] += 1
@@ -628,7 +631,9 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
                     global_stats["models"][model]["messages"] += mstats["messages"]
                     global_stats["models"][model]["tokens"] += mstats["tokens"]
                     global_stats["models"][model]["cost"] += mstats["cost"]
-                    global_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
+                    global_stats["models"][model]["llm_time"] += mstats.get(
+                        "llm_time", 0
+                    )
                     global_stats["models"][model]["output_tokens"] += mstats.get(
                         "output_tokens", 0
                     )
@@ -1619,7 +1624,7 @@ def generate_html():
 
                 // If no subagent sessions, just show the main session as a regular row
                 if (!hasSubs) {
-                    const sessionUrl = '/session?path=' + encodeURIComponent(s.path);
+                    const sessionUrl = '/session?agent_cmd=' + encodeURIComponent(s.agent_cmd) + '&path=' + encodeURIComponent(s.path);
                     const resumePath = s.path.replace(/\\\\/g, '/');
                     const resumeCmd = 'cd "' + s.cwd + '" && ' + s.agent_cmd + ' --session "' + resumePath + '"';
                     const encodedCmd = encodeURIComponent(resumeCmd);
@@ -1670,7 +1675,7 @@ def generate_html():
                 const dateDisplay = s.start_display;
 
                 // Summary row with resume/open buttons
-                const sessionUrl = '/session?path=' + encodeURIComponent(s.path);
+                const sessionUrl = '/session?agent_cmd=' + encodeURIComponent(s.agent_cmd) + '&path=' + encodeURIComponent(s.path);
                 const resumePath = s.path.replace(/\\\\/g, '/');
                 const resumeCmd = 'cd "' + s.cwd + '" && ' + s.agent_cmd + ' --session "' + resumePath + '"';
                 const encodedCmd = encodeURIComponent(resumeCmd);
@@ -1726,7 +1731,7 @@ def generate_html():
 
                 // Subagent sessions with buttons
                 subs.forEach(sub => {
-                    const subSessionUrl = '/session?path=' + encodeURIComponent(sub.path);
+                    const subSessionUrl = '/session?agent_cmd=' + encodeURIComponent(sub.agent_cmd) + '&path=' + encodeURIComponent(sub.path);
                     const subResumePath = sub.path.replace(/\\\\/g, '/');
                     const subResumeCmd = 'cd "' + sub.cwd + '" && ' + sub.agent_cmd + ' --session "' + subResumePath + '"';
                     const subEncodedCmd = encodeURIComponent(subResumeCmd);
@@ -1846,11 +1851,13 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/session":
             session_path = query.get("path", [None])[0]
+            agent_cmd = query.get("agent_cmd", ["pi"])[0]
+            # TODO: security, this allows for arbitrary command execution
             if session_path and Path(session_path).exists():
                 self.send_response(200)
                 self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
-                html_content = export_session_to_html(session_path)
+                html_content = export_session_to_html(session_path, agent_cmd)
                 self.wfile.write(html_content.encode("utf-8"))
             else:
                 self.send_response(404)
@@ -1871,7 +1878,11 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="Agent Cost Dashboard Server")
     parser.add_argument(
-        "-H", "--host", type=str, default="localhost", help="Host to bind to (default: localhost)"
+        "-H",
+        "--host",
+        type=str,
+        default="localhost",
+        help="Host to bind to (default: localhost)",
     )
     parser.add_argument(
         "-p", "--port", type=int, default=8753, help="Port to serve on (default: 8753)"
@@ -1893,7 +1904,7 @@ def main():
     httpd = DashboardServer((args.host, args.port), DashboardHandler)
     print("🚀 Agent Cost Dashboard")
     print(f"   Serving on: http://{args.host}:{args.port}")
-    print(f"   Data from:")
+    print("   Data from:")
     for sessions_dir, agent_cmd in SESSIONS_DIRS:
         exists = "✓" if sessions_dir.exists() else "✗"
         print(f"     {exists} {sessions_dir} ({agent_cmd})")

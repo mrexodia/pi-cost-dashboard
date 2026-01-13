@@ -3,12 +3,14 @@ import os
 import json
 import argparse
 
-from typing import TypedDict, Optional, NotRequired
+from typing import TypedDict
 from glob import glob
+
 
 class CacheCreation(TypedDict):
     ephemeral_5m_input_tokens: int
     ephemeral_1h_input_tokens: int
+
 
 class Usage(TypedDict):
     input_tokens: int
@@ -18,11 +20,13 @@ class Usage(TypedDict):
     output_tokens: int
     service_tier: str
 
+
 class Cost(TypedDict):
     input: float
     output: float
     cache_read: float
     cache_write: float
+
 
 COST_MAP: dict[str, Cost] = {
     "claude-opus-4-5-20251101": {
@@ -54,8 +58,9 @@ COST_MAP: dict[str, Cost] = {
         "output": 1.1,
         "cache_read": 0.03,
         "cache_write": 0.0,
-    }
+    },
 }
+
 
 def session_cost(path: str) -> tuple[int, float]:
     acc_tokens = 0
@@ -72,7 +77,7 @@ def session_cost(path: str) -> tuple[int, float]:
                 cache_write = usage.get("cache_creation_input_tokens", 0)
                 total = input + output + cache_read + cache_write
                 model = message.get("model", "")
-                assert model, f"missing model"
+                assert model, "missing model"
                 if model == "<synthetic>":
                     continue
                 cost = COST_MAP.get(model)
@@ -81,15 +86,20 @@ def session_cost(path: str) -> tuple[int, float]:
                 output_cost = output * cost["output"]
                 cache_read_cost = cache_read * cost["cache_read"]
                 cache_write_cost = cache_write * cost["cache_write"]
-                total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost
+                total_cost = (
+                    input_cost + output_cost + cache_read_cost + cache_write_cost
+                )
                 acc_tokens += total
                 acc_cost += total_cost
     acc_cost /= 1e6
     return acc_tokens, acc_cost
 
+
 def main():
     parser = argparse.ArgumentParser("Claude code cost calculator")
-    parser.add_argument("path", help="Path to folder of claude sessions or single jsonl")
+    parser.add_argument(
+        "path", help="Path to folder of claude sessions or single jsonl"
+    )
     args = parser.parse_args()
     path = args.path
     files = []
@@ -121,6 +131,7 @@ def main():
         print("\n===\n")
         print(f"Total tokens: {acc_tokens}")
         print(f"  Total cost: ${acc_cost:.2f}")
+
 
 if __name__ == "__main__":
     main()
