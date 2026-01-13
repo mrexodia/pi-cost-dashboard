@@ -1715,7 +1715,7 @@ def generate_html():
                             <td class="tokens">${s.tokens.toLocaleString()}</td>
                             <td class="cost">$${s.cost.toFixed(2)}</td>
                             <td>
-                                <button onclick="copyResumeCommand(decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
+                                <button onclick="copyResumeCommand(event, decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
                                 <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
                             </td>
                         </tr>
@@ -1772,7 +1772,7 @@ def generate_html():
                         <td class="tokens">${aggTokens.toLocaleString()}</td>
                         <td class="cost">$${aggCost.toFixed(2)}</td>
                         <td>
-                            <button onclick="event.stopPropagation(); copyResumeCommand(decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
+                            <button onclick="event.stopPropagation(); copyResumeCommand(event, decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
                             <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session" onclick="event.stopPropagation()">Open →</a>
                         </td>
                     </tr>
@@ -1796,7 +1796,7 @@ def generate_html():
                         <span class="model-stat">${s.tokens.toLocaleString()} tok</span>
                         <span class="model-stat cost">$${s.cost.toFixed(2)}</span>
                         <span style="margin-left: 8px">
-                            <button onclick="copyResumeCommand(decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
+                            <button onclick="copyResumeCommand(event, decodeURIComponent('${encodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
                             <a href="${sessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
                         </span>
                     </div>
@@ -1827,7 +1827,7 @@ def generate_html():
                             <span class="model-stat">${sub.tokens.toLocaleString()} tok</span>
                             <span class="model-stat cost">$${sub.cost.toFixed(2)}</span>
                             <span style="margin-left: 8px">
-                                <button onclick="copyResumeCommand(decodeURIComponent('${subEncodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
+                                <button onclick="copyResumeCommand(event, decodeURIComponent('${subEncodedCmd}'))" class="icon-btn" title="Resume session">📋</button>
                                 <a href="${subSessionUrl}" class="session-link" target="_blank" title="View full session">Open →</a>
                             </span>
                         </div>
@@ -1844,10 +1844,10 @@ def generate_html():
             tbody.innerHTML = html;
         }
         
-        function copyResumeCommand(cmd) {
-            navigator.clipboard.writeText(cmd).then(() => {
-                // Briefly show success feedback
-                const btn = event.target;
+        function copyResumeCommand(event, cmd) {
+            const btn = event.target;
+            
+            function showSuccess() {
                 const originalText = btn.textContent;
                 btn.textContent = '✓';
                 btn.style.color = 'var(--accent-green)';
@@ -1855,9 +1855,30 @@ def generate_html():
                     btn.textContent = originalText;
                     btn.style.color = '';
                 }, 1500);
-            }).catch(err => {
-                console.error('Failed to copy:', err);
-            });
+            }
+            
+            // Use clipboard API if available (HTTPS or localhost)
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(cmd).then(showSuccess).catch(err => {
+                    console.error('Failed to copy:', err);
+                });
+            } else {
+                // Fallback for HTTP contexts
+                const textArea = document.createElement('textarea');
+                textArea.value = cmd;
+                textArea.style.position = 'fixed';
+                textArea.style.left = '-9999px';
+                textArea.setAttribute('readonly', '');
+                document.body.appendChild(textArea);
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    showSuccess();
+                } catch (err) {
+                    console.error('Fallback copy failed:', err);
+                }
+                document.body.removeChild(textArea);
+            }
         }
         
         function setupSorting(tableId, sortState, renderFn) {
